@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import asyncio
 import logging
 import threading
@@ -23,23 +24,57 @@ HEADERS = {
     "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
 }
 
-# chat_id -> قائمة منتجات
+PRICE_SELECTORS = [
+    "#corePrice_feature_div span.a-offscreen",
+    "span.a-price span.a-offscreen",
+    "#priceblock_ourprice",
+    "#priceblock_dealprice",
+    "#price_inside_buybox",
+]
+
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
+
 tracked = {}
 
 
-def get_product(url):
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    soup = BeautifulSoup(r.text, "html.parser")
-    title_tag = soup.select_one("#productTitle")
-    price_tag = soup.select_one("span.a-price span.a-offscreen")
-    if not title_tag or not price_tag:
-        return None, None
-    title = title_tag.get_text(strip=True)
-    digits = re.sub(r"[^\d.]", "", price_tag.get_text().replace(",", ""))
+def parse_price(text):
+    text = text.translate(AR_DIGITS).replace(",", "")
+    digits = re.sub(r"[^\d.]", "", text)
     try:
-        return title, float(digits)
+        return float(digits)
     except ValueError:
-        return None, None
+        return None
+
+
+def get_product(url):
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        except requests.RequestException as e:
+            logging.warning("Request failed: %s", e)
+            time.sleep(2)
+            continue
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        title_tag = soup.select_one("#productTitle")
+        if not title_tag:
+            page_title = soup.title.get_text(strip=True) if soup.title else None
+            logging.warning(
+                "No product title (status %s, page: %s)", r.status_code, page_title
+            )
+            time.sleep(3)
+            continue
+
+        title = title_tag.get_text(strip=True)
+        for sel in PRICE_SELECTORS:
+            tag = soup.select_one(sel)
+            if tag:
+                price = parse_price(tag.get_text())
+                if price:
+                    return title, price
+        logging.warning("No price found for: %s", title[:40])
+        return title, None
+    return None, None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -65,9 +100,9 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("ثواني، بقرا المنتج...")
     title, price = await asyncio.to_thread(get_product, url)
-    if title is None:
+    if title is None or price is None:
         await update.message.reply_text(
-            "معرفتش أقرا السعر. جرب رابط تاني أو حاول بعد شوية."
+            "معرفتش أقرا السعر. ممكن المنتج مش متوفر دلوقتي، أو أمازون منعت الطلب. جرب بعد شوية."
         )
         return
 
@@ -117,7 +152,6 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
 
 
-# سيرفر صغير عشان Render يفضل شغال
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -135,6 +169,7 @@ def run_server():
 
 def main():
     threading.Thread(target=run_server, daemon=True).start()
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("track", track))
