@@ -4,6 +4,7 @@ import io
 import asyncio
 import hashlib
 import logging
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -18,6 +19,7 @@ API_HASH = os.environ["API_HASH"]
 SOURCES = ["deals_me", "OffersEgyptofficial", "Raw5aa"]
 TARGET = "PromoCodeOnlain"
 FOOTER = "\n\nقناتنا: @PromoCodeOnlain"
+MY_TAG = "mixdeals-21"
 
 HEADERS = {
     "User-Agent": (
@@ -27,6 +29,7 @@ HEADERS = {
     "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
 }
 URL_RE = re.compile(r"https?://[^\s]+")
+AMAZON_RE = re.compile(r"amazon\.|amzn\.|link\.amazon")
 
 seen = set()
 
@@ -38,6 +41,26 @@ def clean(text):
             continue
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def to_my_link(url):
+    """يحوّل لينك أمازون للينك بكودك. أي لينك تاني بيرجع زي ما هو."""
+    if not AMAZON_RE.search(url):
+        return url
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+        final = r.url
+        host = urlparse(final).netloc or "www.amazon.eg"
+        m = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", final)
+        if m:
+            return f"https://{host}/dp/{m.group(1)}?tag={MY_TAG}"
+        if "tag=" in final:
+            return re.sub(r"([?&])tag=[^&]*", r"\1tag=" + MY_TAG, final)
+        sep = "&" if "?" in final else "?"
+        return f"{final}{sep}tag={MY_TAG}"
+    except Exception as e:
+        logging.warning("Link resolve failed: %s", e)
+        return url
 
 
 def get_image(url):
@@ -82,8 +105,14 @@ async def main():
         text = clean(raw)
         if not text:
             return
-        if urls and urls[0] not in text:
-            text += "\n\n" + urls[0]
+
+        new_urls = []
+        for u in urls:
+            new_urls.append(await asyncio.to_thread(to_my_link, u))
+        for old, new in zip(urls, new_urls):
+            text = text.replace(old, new)
+        if new_urls and new_urls[0] not in text:
+            text += "\n\n" + new_urls[0]
 
         key = hashlib.md5(text.encode()).hexdigest()
         if key in seen:
@@ -92,8 +121,8 @@ async def main():
 
         full = text + FOOTER
         image = None
-        if urls:
-            image = await asyncio.to_thread(get_image, urls[0])
+        if new_urls:
+            image = await asyncio.to_thread(get_image, new_urls[0])
 
         try:
             if image and len(full) <= 1000:
