@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import html
 import asyncio
 import hashlib
 import logging
@@ -17,9 +18,9 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 
 SOURCES = ["deals_me", "OffersEgyptofficial", "Raw5aa"]
-TARGET = "PromoCodeOnlain"
-FOOTER = "\n\nقناتنا: @PromoCodeOnlain"
+PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
+FOOTER = "📢 للمزيد من العروض يوميًا: @PromoCodeOnlain"
 
 HEADERS = {
     "User-Agent": (
@@ -31,16 +32,37 @@ HEADERS = {
 URL_RE = re.compile(r"https?://[^\s]+")
 AMAZON_RE = re.compile(r"amazon\.|amzn\.|link\.amazon")
 
+PROMO_WORDS = [
+    "واتساب", "واتس اب", "whatsapp", "تابعنا", "تابعونا", "للانضمام",
+    "انضم", "اشترك", "جروب", "قناتنا", "قنواتنا", "منصات التواصل",
+    "فيسبوك", "facebook", "انستجرام", "انستغرام", "instagram",
+    "تيك توك", "tiktok", "تليجرام", "telegram",
+]
+BAD_URL_PARTS = [
+    "t.me", "wa.me", "whatsapp.com", "facebook.com", "fb.com",
+    "instagram.com", "tiktok.com", "youtube.com", "youtu.be",
+]
+
 seen = set()
+target_box = {}
 
 
-def clean(text):
+def clean_lines(raw):
     lines = []
-    for line in text.splitlines():
-        if "t.me/" in line or re.search(r"@\w+", line):
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            lines.append("")
             continue
-        lines.append(line)
-    return "\n".join(lines).strip()
+        low = s.lower()
+        if any(w in low for w in PROMO_WORDS):
+            continue
+        if any(b in low for b in BAD_URL_PARTS) or re.search(r"@\w+", s):
+            continue
+        if re.fullmatch(r"[\W_]+", s):
+            continue
+        lines.append(s)
+    return lines
 
 
 def to_my_link(url):
@@ -88,11 +110,45 @@ def get_image(url):
         return None
 
 
+def replace_all(line, olds, news):
+    for o, n in zip(olds, news):
+        line = line.replace(o, n)
+    return line
+
+
+def build_post(lines, urls):
+    esc = html.escape
+    single = len(set(urls)) <= 1
+
+    if single:
+        lines = [l for l in lines if "http" not in l]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines:
+        return None
+
+    parts = ["🔥 <b>" + esc(lines[0]) + "</b>"]
+    rest = "\n".join(lines[1:]).strip()
+    rest = re.sub(r"\n{3,}", "\n\n", rest)
+    if rest:
+        parts.append(esc(rest))
+    if single and urls:
+        parts.append('🛒 <a href="' + esc(urls[0], quote=True) + '">اشتري من هنا</a>')
+    parts.append(esc(FOOTER))
+    return "\n\n".join(parts)
+
+
 async def main():
     client = TelegramClient("session", API_ID, API_HASH)
 
     @client.on(events.NewMessage(chats=SOURCES))
     async def handler(event):
+        target = target_box.get("entity")
+        if target is None:
+            return
+
         msg = event.message
         raw = msg.message or ""
 
@@ -100,45 +156,58 @@ async def main():
         for ent in msg.entities or []:
             if isinstance(ent, MessageEntityTextUrl):
                 urls.append(ent.url)
-        urls = [u.rstrip(").,") for u in urls if "t.me" not in u]
+        urls = [u.rstrip(").,") for u in urls]
+        urls = [u for u in urls if not any(b in u.lower() for b in BAD_URL_PARTS)]
 
-        text = clean(raw)
-        if not text:
+        lines = clean_lines(raw)
+        if not any(lines):
             return
 
         new_urls = []
         for u in urls:
             new_urls.append(await asyncio.to_thread(to_my_link, u))
-        for old, new in zip(urls, new_urls):
-            text = text.replace(old, new)
-        if new_urls and new_urls[0] not in text:
-            text += "\n\n" + new_urls[0]
+        lines = [replace_all(l, urls, new_urls) for l in lines]
 
-        key = hashlib.md5(text.encode()).hexdigest()
+        uniq = list(dict.fromkeys(new_urls))
+        post = build_post(lines, uniq)
+        if not post:
+            return
+
+        key = hashlib.md5(post.encode()).hexdigest()
         if key in seen:
             return
         seen.add(key)
 
-        full = text + FOOTER
         image = None
-        if new_urls:
-            image = await asyncio.to_thread(get_image, new_urls[0])
+        if uniq:
+            image = await asyncio.to_thread(get_image, uniq[0])
 
         try:
-            if image and len(full) <= 1000:
-                await client.send_message(TARGET, full, file=image)
+            if image and len(post) <= 1000:
+                await client.send_message(target, post, file=image, parse_mode="html")
             elif image:
-                await client.send_message(TARGET, "", file=image)
-                await client.send_message(TARGET, full, link_preview=False)
+                await client.send_message(target, "", file=image)
+                await client.send_message(target, post, parse_mode="html", link_preview=False)
             else:
-                await client.send_message(TARGET, full, link_preview=False)
-            logging.info("Posted: %s", text[:40])
+                await client.send_message(target, post, parse_mode="html", link_preview=False)
+            logging.info("Posted: %s", lines[0][:40])
         except Exception as e:
             logging.warning("Failed to post: %s", e)
         await asyncio.sleep(3)
 
     await client.start()
-    logging.info("Running. Waiting for new posts...")
+
+    names = []
+    async for d in client.iter_dialogs():
+        names.append(d.name)
+        if d.name == PRIVATE_TITLE:
+            target_box["entity"] = d.entity
+            break
+    if "entity" not in target_box:
+        logging.error("Channel '%s' not found. Your chats: %s", PRIVATE_TITLE, names[:15])
+        return
+
+    logging.info("Running. Posting to private channel: %s", PRIVATE_TITLE)
     await client.run_until_disconnected()
 
 
