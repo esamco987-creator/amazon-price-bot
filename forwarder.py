@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageEntityTextUrl
 
@@ -20,7 +21,10 @@ API_HASH = os.environ["API_HASH"]
 SOURCES = ["arkhashomoffers", "OffersEgyptofficial", "Raw5aa"]
 PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
-FOOTER = "📢 للمزيد من العروض يوميًا: @PromoCodeOnlain"
+FOOTER = "📢 قناة عروض وخصومات\nللمزيد من العروض يوميًا: @PromoCodeOnlain"
+
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+LOGO_RATIO = 0.22  # حجم الشعار نسبة لعرض الصورة
 
 HEADERS = {
     "User-Agent": (
@@ -85,6 +89,24 @@ def to_my_link(url):
         return url
 
 
+def add_logo(data):
+    """يحط الشعار في الركن التحتاني الأيمن. لو حصل أي خطأ بيرجع الصورة زي ما هي."""
+    try:
+        base = Image.open(io.BytesIO(data)).convert("RGBA")
+        logo = Image.open(LOGO_PATH).convert("RGBA")
+        w = max(int(base.width * LOGO_RATIO), 60)
+        h = int(logo.height * w / logo.width)
+        logo = logo.resize((w, h), Image.LANCZOS)
+        margin = int(base.width * 0.03)
+        base.alpha_composite(logo, (base.width - w - margin, base.height - h - margin))
+        out = io.BytesIO()
+        base.convert("RGB").save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        logging.warning("Logo overlay failed: %s", e)
+        return data
+
+
 def get_image(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
@@ -102,6 +124,7 @@ def get_image(url):
         data = requests.get(img_url, headers=HEADERS, timeout=20).content
         if len(data) < 2000:
             return None
+        data = add_logo(data)
         bio = io.BytesIO(data)
         bio.name = "product.jpg"
         return bio
