@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO)
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 
-SOURCES = ["deals_me", "OffersEgyptofficial", "Raw5aa"]
+SOURCES = ["arkhashomoffers", "OffersEgyptofficial", "Raw5aa"]
 PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
 FOOTER = "📢 للمزيد من العروض يوميًا: @PromoCodeOnlain"
