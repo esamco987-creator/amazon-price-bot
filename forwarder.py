@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import time
 import html
 import asyncio
 import hashlib
@@ -164,7 +165,10 @@ def build_post(lines, urls):
 
 
 async def main():
-    client = TelegramClient("session", API_ID, API_HASH)
+    client = TelegramClient(
+        "session", API_ID, API_HASH,
+        connection_retries=None, retry_delay=5, auto_reconnect=True,
+    )
 
     @client.on(events.NewMessage(chats=SOURCES))
     async def handler(event):
@@ -234,4 +238,12 @@ async def main():
     await client.run_until_disconnected()
 
 
-asyncio.run(main())
+while True:
+    try:
+        asyncio.run(main())
+        break
+    except KeyboardInterrupt:
+        break
+    except Exception as e:
+        logging.warning("Stopped: %s. Restarting in 30 seconds...", e)
+        time.sleep(30)
