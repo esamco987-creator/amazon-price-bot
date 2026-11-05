@@ -22,7 +22,11 @@ API_HASH = os.environ["API_HASH"]
 SOURCES = ["arkhashomoffers", "OffersEgyptofficial", "Raw5aa"]
 PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
-FOOTER = "📢 قناة عروض وخصومات\nللمزيد من العروض يوميًا: @PromoCodeOnlain"
+FOOTER = (
+    "📢 قناة عروض وخصومات\n"
+    "للمزيد من العروض يوميًا:\n"
+    "https://t.me/PromoCodeOnlain"
+)
 
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 LOGO_RATIO = 0.22  # حجم الشعار نسبة لعرض الصورة
@@ -102,148 +106,4 @@ def add_logo(data):
         base.alpha_composite(logo, (base.width - w - margin, base.height - h - margin))
         out = io.BytesIO()
         base.convert("RGB").save(out, "JPEG", quality=92)
-        return out.getvalue()
-    except Exception as e:
-        logging.warning("Logo overlay failed: %s", e)
-        return data
-
-
-def get_image(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        soup = BeautifulSoup(r.text, "html.parser")
-        img_url = None
-        tag = soup.find("meta", property="og:image")
-        if tag and tag.get("content"):
-            img_url = tag["content"]
-        if not img_url:
-            img = soup.select_one("#landingImage") or soup.select_one("#imgTagWrapperId img")
-            if img:
-                img_url = img.get("data-old-hires") or img.get("src")
-        if not img_url or not img_url.startswith("http"):
-            return None
-        data = requests.get(img_url, headers=HEADERS, timeout=20).content
-        if len(data) < 2000:
-            return None
-        data = add_logo(data)
-        bio = io.BytesIO(data)
-        bio.name = "product.jpg"
-        return bio
-    except Exception as e:
-        logging.warning("Image fetch failed: %s", e)
-        return None
-
-
-def replace_all(line, olds, news):
-    for o, n in zip(olds, news):
-        line = line.replace(o, n)
-    return line
-
-
-def build_post(lines, urls):
-    esc = html.escape
-    single = len(set(urls)) <= 1
-
-    if single:
-        lines = [l for l in lines if "http" not in l]
-    while lines and not lines[0]:
-        lines.pop(0)
-    while lines and not lines[-1]:
-        lines.pop()
-    if not lines:
-        return None
-
-    parts = ["🔥 <b>" + esc(lines[0]) + "</b>"]
-    rest = "\n".join(lines[1:]).strip()
-    rest = re.sub(r"\n{3,}", "\n\n", rest)
-    if rest:
-        parts.append(esc(rest))
-    if single and urls:
-        parts.append('🛒 <a href="' + esc(urls[0], quote=True) + '">اشتري من هنا</a>')
-    parts.append(esc(FOOTER))
-    return "\n\n".join(parts)
-
-
-async def main():
-    client = TelegramClient(
-        "session", API_ID, API_HASH,
-        connection_retries=None, retry_delay=5, auto_reconnect=True,
-    )
-
-    @client.on(events.NewMessage(chats=SOURCES))
-    async def handler(event):
-        target = target_box.get("entity")
-        if target is None:
-            return
-
-        msg = event.message
-        raw = msg.message or ""
-
-        urls = URL_RE.findall(raw)
-        for ent in msg.entities or []:
-            if isinstance(ent, MessageEntityTextUrl):
-                urls.append(ent.url)
-        urls = [u.rstrip(").,") for u in urls]
-        urls = [u for u in urls if not any(b in u.lower() for b in BAD_URL_PARTS)]
-
-        lines = clean_lines(raw)
-        if not any(lines):
-            return
-
-        new_urls = []
-        for u in urls:
-            new_urls.append(await asyncio.to_thread(to_my_link, u))
-        lines = [replace_all(l, urls, new_urls) for l in lines]
-
-        uniq = list(dict.fromkeys(new_urls))
-        post = build_post(lines, uniq)
-        if not post:
-            return
-
-        key = hashlib.md5(post.encode()).hexdigest()
-        if key in seen:
-            return
-        seen.add(key)
-
-        image = None
-        if uniq:
-            image = await asyncio.to_thread(get_image, uniq[0])
-
-        try:
-            if image and len(post) <= 1000:
-                await client.send_message(target, post, file=image, parse_mode="html")
-            elif image:
-                await client.send_message(target, "", file=image)
-                await client.send_message(target, post, parse_mode="html", link_preview=False)
-            else:
-                await client.send_message(target, post, parse_mode="html", link_preview=False)
-            logging.info("Posted: %s", lines[0][:40])
-        except Exception as e:
-            logging.warning("Failed to post: %s", e)
-        await asyncio.sleep(3)
-
-    await client.start()
-
-    names = []
-    async for d in client.iter_dialogs():
-        names.append(d.name)
-        if d.name == PRIVATE_TITLE:
-            target_box["entity"] = d.entity
-            break
-    if "entity" not in target_box:
-        logging.error("Channel '%s' not found. Your chats: %s", PRIVATE_TITLE, names[:15])
-        return
-
-    logging.info("Running. Posting to private channel: %s", PRIVATE_TITLE)
-    await client.run_until_disconnected()
-
-
-while True:
-    try:
-        asyncio.run(main())
-        break
-    except KeyboardInterrupt:
-        break
-    except Exception as e:
-        logging.warning("Stopped: %s. Restarting in 30 seconds...", e)
-        time.sleep(30)
+        return out.ge
