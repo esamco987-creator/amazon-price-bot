@@ -92,18 +92,3 @@ def to_my_link(url):
     except Exception as e:
         logging.warning("Link resolve failed: %s", e)
         return url
-
-
-def add_logo(data):
-    """يحط الشعار في الركن التحتاني الأيمن. لو حصل أي خطأ بيرجع الصورة زي ما هي."""
-    try:
-        base = Image.open(io.BytesIO(data)).convert("RGBA")
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        w = max(int(base.width * LOGO_RATIO), 60)
-        h = int(logo.height * w / logo.width)
-        logo = logo.resize((w, h), Image.LANCZOS)
-        margin = int(base.width * 0.03)
-        base.alpha_composite(logo, (base.width - w - margin, base.height - h - margin))
-        out = io.BytesIO()
-        base.convert("RGB").save(out, "JPEG", quality=92)
-        return out.ge
