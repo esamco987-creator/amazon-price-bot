@@ -2,9 +2,9 @@ import os
 import re
 import io
 import json
-import uuid
 import html
 import random
+import string
 import asyncio
 import logging
 from urllib.parse import urlparse
@@ -12,465 +12,516 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 from PIL import Image
-from telegram import (
-    Update, LinkPreviewOptions, InlineKeyboardButton, InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+for _n in ("httpx", "httpcore", "telegram", "apscheduler", "urllib3"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
+log = logging.getLogger("post_bot")
 
-TOKEN = os.environ["POST_BOT_TOKEN"]
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+TOKEN = os.environ.get("POST_BOT_TOKEN", "")
+try:
+    OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+except ValueError:
+    OWNER_ID = 0
+
 CHANNEL = "@PromoCodeOnlain"
-CHANNEL_URL = "https://t.me/PromoCodeOnlain"
 MY_TAG = "mixdeals-21"
+CHANNEL_LINK = "https://t.me/PromoCodeOnlain"
+BASE = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.path.join(BASE, "allowed_users.json")
+LOGO_FILE = os.path.join(BASE, "logo.png")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOGO_PATH = os.path.join(BASE_DIR, "logo.png")
-USERS_FILE = os.path.join(BASE_DIR, "allowed_users.json")
-
-CANVAS = 1080        # مقاس الصورة النهائية (مربع)
-PRODUCT_BOX = 0.80   # حجم المنتج جوه المربع
-LOGO_RATIO = 0.16    # حجم الشعار نسبة لعرض المربع
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    ),
-    "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
-}
-URL_RE = re.compile(r"https?://[^\s]+")
-AMAZON_RE = re.compile(r"amazon\.|amzn\.|link\.amazon")
-AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
+CANVAS = 1080
+PRODUCT_BOX = 0.80
+LOGO_RATIO = 0.16
 
 OPENERS = [
-    "🔥 عرض مميز",
-    "⚡ فرصة للتوفير",
-    "💥 خصم يستاهل",
-    "🛍️ اكتشف العرض ده",
-    "🎯 عرض النهاردة",
+    "🔥 عرض يستاهل تلحقه!",
+    "⚡ فرصة حلوة متتفوتش!",
+    "💥 لقينالك عرض جامد!",
+    "🛍️ عرض النهاردة مختلف!",
+    "😍 ده من العروض اللي بتخلص بسرعة!",
 ]
 CLOSERS = [
-    "الأسعار بتتغير بسرعة، اتأكد من السعر في الصفحة قبل الشراء.",
-    "السعر المكتوب وقت النشر وممكن يتغير في أي لحظة.",
+    "⏳ الكمية والسعر ممكن يتغيروا في أي وقت.",
+    "👌 اطلبه قبل ما يخلص.",
+    "🚚 تأكد من السعر النهائي قبل الشراء.",
+    "✅ شوف التفاصيل من الرابط.",
 ]
 
+UA_CHROME = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+)
+UA_DESKTOP = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+UA_BOT = "Mozilla/5.0 (compatible; TelegramBot/1.0; +https://telegram.org)"
 
+HEADER_STRATEGIES = [
+    {"User-Agent": UA_CHROME},
+    {
+        "User-Agent": UA_DESKTOP,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
+    },
+    {"User-Agent": UA_BOT},
+]
+
+AMAZON_HOSTS = ("amazon.", "amzn.", "a.co", "link.amazon")
+
+
+# ---------------------------------------------------------------- users
 def load_users():
     try:
-        with open(USERS_FILE, encoding="utf-8") as f:
-            return {int(k): v for k, v in json.load(f).items()}
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def save_users(users):
+def save_users(data):
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in users.items()}, f, ensure_ascii=False)
+            json.dump(data, f, ensure_ascii=False)
     except Exception as e:
-        logging.warning("Could not save users: %s", e)
+        log.warning("save_users failed: %s", e)
 
 
-ALLOWED = load_users()  # رقم الحساب -> الاسم
-asked = set()  # اللي بعتوا طلب دخول في الجلسة دي
+ALLOWED = load_users()
 
 
 def is_allowed(uid):
-    return bool(uid) and (uid == OWNER_ID or uid in ALLOWED)
+    return uid == OWNER_ID or str(uid) in ALLOWED
+
+
+# ---------------------------------------------------------------- helpers
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
 
 
 def parse_price(text):
-    text = (text or "").translate(AR_DIGITS).replace(",", "")
-    m = re.search(r"\d+(?:\.\d+)?", text)
-    return float(m.group()) if m else None
-
-
-def fmt(n):
-    return f"{int(n):,}" if float(n).is_integer() else f"{n:,.2f}"
-
-
-def resolve(url):
+    if not text:
+        return None
+    t = text.translate(AR_DIGITS)
+    m = re.search(r"\d[\d,]*\.?\d*", t)
+    if not m:
+        return None
+    num = m.group(0).replace(",", "")
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        return r.url, r.text
-    except Exception as e:
-        logging.warning("Fetch failed: %s", e)
-        return url, ""
+        v = float(num)
+    except ValueError:
+        return None
+    return v if v > 0 else None
 
 
-def affiliate(final):
-    if not AMAZON_RE.search(final):
-        return final
-    host = urlparse(final).netloc or "www.amazon.eg"
-    m = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", final)
-    if m:
-        return f"https://{host}/dp/{m.group(1)}?tag={MY_TAG}"
-    if "tag=" in final:
-        return re.sub(r"([?&])tag=[^&]*", r"\1tag=" + MY_TAG, final)
-    sep = "&" if "?" in final else "?"
-    return f"{final}{sep}tag={MY_TAG}"
+def fmt(v):
+    if v == int(v):
+        return f"{int(v):,} جنيه"
+    return f"{v:,.2f} جنيه"
 
 
 def first_text(soup, selectors):
     for sel in selectors:
-        tag = soup.select_one(sel)
-        if tag:
-            t = tag.get_text(" ", strip=True)
+        for el in soup.select(sel):
+            t = el.get_text(" ", strip=True)
             if t:
                 return t
-    return None
+    return ""
+
+
+def find_asin(text):
+    if not text:
+        return None
+    m = re.search(r"/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})", text)
+    return m.group(1) if m else None
+
+
+def affiliate(host, asin):
+    return f"https://{host}/dp/{asin}?tag={MY_TAG}"
+
+
+def is_amazon_host(host):
+    host = (host or "").lower()
+    return any(p in host for p in AMAZON_HOSTS)
+
+
+def get_page(url, debug):
+    """Try several header strategies. Returns (final_url, html) of the best page."""
+    best = (url, "")
+    for i, headers in enumerate(HEADER_STRATEGIES, 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
+            body = r.text or ""
+            has_title = "productTitle" in body
+            debug.append(f"محاولة {i}: حالة {r.status_code}، طول {len(body)}، عنوان {'✔' if has_title else '✘'}")
+            log.info("fetch try %s status=%s len=%s title=%s", i, r.status_code, len(body), has_title)
+            if len(body) > len(best[1]) or (r.url and not best[1]):
+                best = (r.url, body)
+            if r.status_code == 200 and has_title:
+                return r.url, body
+        except Exception as e:
+            debug.append(f"محاولة {i}: خطأ {type(e).__name__}")
+            log.warning("fetch try %s error: %s", i, e)
+    return best
+
+
+def clean_title(t):
+    t = re.sub(r"^\s*(Amazon\.eg|Amazon\.com|أمازون)\s*[:：\-]\s*", "", t or "", flags=re.I)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def read_product(page):
     soup = BeautifulSoup(page, "html.parser")
-    title = first_text(soup, ["#productTitle"])
+
+    title = first_text(soup, ["#productTitle", "span#productTitle", "h1#title span"])
     if not title:
         og = soup.find("meta", property="og:title")
         if og and og.get("content"):
-            title = og["content"].strip()
+            title = og["content"]
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string
+    title = clean_title(title)
 
-    price = parse_price(first_text(soup, [
-        "#corePrice_feature_div span.a-offscreen",
-        "span.a-price span.a-offscreen",
-        "#priceblock_ourprice",
-        "#priceblock_dealprice",
-    ]))
-    old = parse_price(first_text(soup, [
-        "span.a-price.a-text-price span.a-offscreen",
-        ".basisPrice span.a-offscreen",
-        "#listPrice",
-    ]))
+    price_txt = first_text(
+        soup,
+        [
+            "#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) .a-offscreen",
+            "#corePrice_feature_div .a-price:not(.a-text-price) .a-offscreen",
+            "#apex_desktop .a-price:not(.a-text-price) .a-offscreen",
+            ".priceToPay .a-offscreen",
+            "span.a-price:not(.a-text-price) .a-offscreen",
+            "#priceblock_ourprice",
+            "#priceblock_dealprice",
+            "#price_inside_buybox",
+        ],
+    )
+    price = parse_price(price_txt)
 
-    rating = None
-    rt = first_text(soup, ["#acrPopover .a-icon-alt", "span.a-icon-alt"])
-    if rt:
-        m = re.search(r"\d+(?:[.,]\d+)?", rt.translate(AR_DIGITS))
-        if m:
-            val = float(m.group().replace(",", "."))
-            if 0 < val <= 5:
-                rating = val
+    old_txt = first_text(
+        soup,
+        [
+            "span.a-price.a-text-price .a-offscreen",
+            "span[data-a-strike='true'] .a-offscreen",
+            "#listPrice",
+            ".basisPrice .a-offscreen",
+        ],
+    )
+    old = parse_price(old_txt)
+    if price and old and old <= price:
+        old = None
 
-    # أكبر نسخة من الصورة
-    img_url = None
-    img = soup.select_one("#landingImage") or soup.select_one("#imgTagWrapperId img")
-    if img:
-        dyn = img.get("data-a-dynamic-image")
+    rating = ""
+    el = soup.select_one("#acrPopover")
+    if el and el.get("title"):
+        rating = el["title"]
+    if not rating:
+        rating = first_text(soup, ["span.a-icon-alt"])
+    m = re.search(r"\d[.,٫]?\d*", (rating or "").translate(AR_DIGITS))
+    rating = m.group(0).replace(",", ".") if m else ""
+
+    img = ""
+    tag = soup.select_one("#landingImage") or soup.select_one("#imgBlkFront")
+    if tag:
+        dyn = tag.get("data-a-dynamic-image")
         if dyn:
             try:
-                sizes = json.loads(html.unescape(dyn))
-                img_url = max(sizes, key=lambda u: sizes[u][0] * sizes[u][1])
+                d = json.loads(html.unescape(dyn))
+                img = max(d.items(), key=lambda kv: kv[1][0] * kv[1][1])[0]
             except Exception:
-                img_url = None
-        if not img_url:
-            img_url = img.get("data-old-hires") or img.get("src")
-    if not img_url:
+                img = ""
+        if not img:
+            img = tag.get("data-old-hires") or tag.get("src") or ""
+    if not img:
         og = soup.find("meta", property="og:image")
         if og and og.get("content"):
-            img_url = og["content"]
-    return title, price, old, rating, img_url
+            img = og["content"]
+
+    return title, price, old, rating, img
 
 
 def full_size(url):
-    """بيشيل علامة التصغير من لينك صور أمازون عشان ناخد الصورة الأصلية."""
-    return re.sub(r"\._[^/]*_\.(jpg|jpeg|png|webp)$", r".\1", url, flags=re.I)
-
-
-def prepare_image(data):
-    """مربع 1080x1080 بخلفية بيضا، المنتج في النص، والشعار في الركن."""
-    try:
-        img = Image.open(io.BytesIO(data)).convert("RGBA")
-        white = Image.new("RGBA", img.size, (255, 255, 255, 255))
-        white.alpha_composite(img)
-        img = white.convert("RGB")
-
-        box = int(CANVAS * PRODUCT_BOX)
-        scale = min(box / img.width, box / img.height, 2.0)
-        size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
-        img = img.resize(size, Image.LANCZOS)
-
-        canvas = Image.new("RGB", (CANVAS, CANVAS), (255, 255, 255))
-        x = (CANVAS - size[0]) // 2
-        y = int((CANVAS - size[1]) / 2 - CANVAS * 0.02)
-        canvas.paste(img, (x, max(y, 0)))
-
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        w = int(CANVAS * LOGO_RATIO)
-        h = int(logo.height * w / logo.width)
-        logo = logo.resize((w, h), Image.LANCZOS)
-        margin = int(CANVAS * 0.02)
-        canvas = canvas.convert("RGBA")
-        canvas.alpha_composite(logo, (CANVAS - w - margin, CANVAS - h - margin))
-
-        out = io.BytesIO()
-        canvas.convert("RGB").save(out, "JPEG", quality=92, optimize=True)
-        return out.getvalue()
-    except Exception as e:
-        logging.warning("Image preparation failed: %s", e)
-        return data
+    return re.sub(r"\._[^/]*?_\.", ".", url) if url else url
 
 
 def fetch_bytes(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
-        if r.status_code == 200 and len(r.content) >= 2000:
-            return r.content
-    except Exception as e:
-        logging.warning("Image download failed: %s", e)
+    for headers in ({"User-Agent": UA_CHROME}, {"User-Agent": UA_DESKTOP}):
+        try:
+            r = requests.get(url, headers=headers, timeout=25)
+            if r.status_code == 200 and len(r.content) > 1000:
+                return r.content
+        except Exception:
+            pass
     return None
 
 
-def download_image(img_url):
-    """بيرجع bytes للصورة بعد التظبيط (وعليها الشعار) أو None."""
-    if not img_url or not img_url.startswith("http"):
+def download_image(url):
+    if not url:
         return None
-    data = None
-    if "amazon" in img_url:
-        data = fetch_bytes(full_size(img_url))
-    if data is None:
-        data = fetch_bytes(img_url)
-    if data is None:
-        return None
-    return prepare_image(data)
+    data = fetch_bytes(full_size(url))
+    if not data:
+        data = fetch_bytes(url)
+    return data
 
 
-def short_title(t, n=90):
+def prepare_image(data):
+    try:
+        im = Image.open(io.BytesIO(data))
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+            bg.alpha_composite(im)
+            im = bg
+        im = im.convert("RGB")
+        box = int(CANVAS * PRODUCT_BOX)
+        im.thumbnail((box, box), Image.LANCZOS)
+        canvas = Image.new("RGB", (CANVAS, CANVAS), (255, 255, 255))
+        canvas.paste(im, ((CANVAS - im.width) // 2, (CANVAS - im.height) // 2))
+        if os.path.exists(LOGO_FILE):
+            logo = Image.open(LOGO_FILE).convert("RGBA")
+            w = int(CANVAS * LOGO_RATIO)
+            logo = logo.resize((w, int(w * logo.height / logo.width)), Image.LANCZOS)
+            pad = 28
+            canvas.paste(logo, (CANVAS - logo.width - pad, CANVAS - logo.height - pad), logo)
+        out = io.BytesIO()
+        canvas.save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        log.warning("prepare_image failed: %s", e)
+        return None
+
+
+def short_title(t, limit=95):
     t = re.sub(r"\s+", " ", t).strip()
-    if len(t) <= n:
+    if len(t) <= limit:
         return t
-    return t[:n].rsplit(" ", 1)[0] + "…"
+    return t[:limit].rsplit(" ", 1)[0] + "…"
 
 
 def build_post(title, price, old, rating, link):
-    esc = html.escape
-    parts = [random.choice(OPENERS) + "\n<b>" + esc(short_title(title)) + "</b>"]
-    info = []
+    lines = [random.choice(OPENERS), "", f"<b>{html.escape(short_title(title))}</b>", ""]
     if price:
-        info.append("💰 السعر: " + fmt(price) + " جنيه")
-        if old and old > price:
+        lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
+        if old:
             pct = round((old - price) / old * 100)
-            info.append("🏷️ كان: " + fmt(old) + " جنيه (خصم " + str(pct) + "%)")
+            lines.append(f"🏷️ كان: <s>{fmt(old)}</s> (خصم {pct}%)")
     if rating:
-        info.append("⭐ التقييم: " + f"{rating:.1f}" + " من 5")
-    if info:
-        parts.append("\n".join(info))
-    parts.append("🛒 اشتري من هنا:\n" + esc(link))
-    parts.append(esc(random.choice(CLOSERS)))
-    parts.append("📢 قناة عروض وخصومات\nللمزيد من العروض يوميًا:\n" + CHANNEL_URL)
-    return "\n\n".join(parts)
-
-
-def photo_file(data):
-    bio = io.BytesIO(data)
-    bio.name = "product.jpg"
-    return bio
+        lines.append(f"⭐ التقييم: {rating} من 5")
+    lines += ["", "🛒 اشتري من هنا:", link, "", random.choice(CLOSERS), ""]
+    lines += ["📢 قناة عروض وخصومات", "للمزيد من العروض يوميًا:", CHANNEL_LINK]
+    return "\n".join(lines)
 
 
 async def send_post(bot, chat_id, image, post, markup=None):
-    """بيبعت البوست (بالصورة لو موجودة). الزرارين بيتحطوا على آخر رسالة."""
-    no_preview = LinkPreviewOptions(is_disabled=True)
     if image and len(post) <= 1000:
-        await bot.send_photo(
-            chat_id, photo=photo_file(image), caption=post,
-            parse_mode="HTML", reply_markup=markup,
-        )
+        await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
     if image:
-        await bot.send_photo(chat_id, photo=photo_file(image))
+        await bot.send_photo(chat_id, photo=image)
     await bot.send_message(
-        chat_id, post, parse_mode="HTML",
-        link_preview_options=no_preview, reply_markup=markup,
+        chat_id,
+        post,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+        disable_web_page_preview=True,
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------------------------------------------------------- product pipeline
+def process_link(url):
+    """Blocking. Returns (ok, data_or_message)."""
+    debug = []
+    try:
+        r = requests.get(url, headers=HEADER_STRATEGIES[0], timeout=25, allow_redirects=True)
+        final = r.url
+    except Exception as e:
+        return False, f"مقدرتش أفتح الرابط ({type(e).__name__})."
+
+    host = urlparse(final).netloc.lower()
+    if not is_amazon_host(host):
+        return False, "البوت بيشتغل مع روابط أمازون بس دلوقتي."
+    if "amazon" not in host:
+        host = "www.amazon.eg"
+
+    asin = find_asin(final) or find_asin(url) or find_asin(r.text)
+    target = f"https://{host}/dp/{asin}" if asin else final
+    final_url, page = get_page(target, debug)
+    if not page:
+        return False, "أمازون مردتش على البوت.\n" + "\n".join(debug)
+    if not asin:
+        asin = find_asin(final_url) or find_asin(page)
+    if not asin:
+        return False, "معرفتش ألاقي كود المنتج (ASIN) في الرابط."
+
+    title, price, old, rating, img = read_product(page)
+    log.info("parsed title=%s price=%s old=%s rating=%s img=%s", bool(title), price, old, rating, bool(img))
+    if not title:
+        return False, "الصفحة اتفتحت بس معرفتش أقرا اسم المنتج.\n" + "\n".join(debug)
+
+    link = affiliate(host, asin)
+    raw = download_image(img)
+    image = prepare_image(raw) if raw else None
+    post = build_post(title, price, old, rating, link)
+    return True, {"image": image, "post": post, "price": price}
+
+
+# ---------------------------------------------------------------- handlers
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    uid = user.id
-    if not OWNER_ID:
-        await update.message.reply_text(
-            f"رقم حسابك هو: {uid}\nاحفظه، هنحتاجه عشان البوت يخدمك انت بس."
-        )
+    if OWNER_ID == 0:
+        await update.message.reply_text(f"رقمك (ID): {user.id}\nحطه في OWNER_ID وشغل البوت تاني.")
         return
-    if is_allowed(uid):
-        await update.message.reply_text(
-            "ابعتلي لينك أي منتج، وهبعتلك معاينة البوست وتحتها زرار نشر."
-        )
+    if is_allowed(user.id):
+        await update.message.reply_text("أهلاً! ابعتلي لينك منتج من أمازون وأنا أجهزلك البوست 🛒")
         return
-
-    await update.message.reply_text(
-        "البوت ده خاص. بعتّ طلب للمسؤول، وهتوصلك رسالة أول ما يوافق."
+    await update.message.reply_text("طلبك اتبعت للمسؤول، استنى الموافقة ✋")
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ قبول", callback_data=f"ap:{user.id}"),
+            InlineKeyboardButton("❌ رفض", callback_data=f"dn:{user.id}"),
+        ]]
     )
-    if uid in asked:
-        return
-    asked.add(uid)
-    name = user.full_name or str(uid)
-    if user.username:
-        name += f" (@{user.username})"
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ قبول", callback_data=f"approve:{uid}"),
-        InlineKeyboardButton("❌ رفض", callback_data=f"deny:{uid}"),
-    ]])
+    name = user.full_name or "مستخدم"
+    uname = f"@{user.username}" if user.username else "بدون يوزر"
     try:
         await context.bot.send_message(
-            OWNER_ID, f"طلب دخول جديد:\n{name}\nرقمه: {uid}", reply_markup=markup
+            OWNER_ID, f"طلب استخدام جديد:\n{name} ({uname})\nID: {user.id}", reply_markup=kb
         )
     except Exception as e:
-        logging.warning("Could not notify owner: %s", e)
+        log.warning("notify owner failed: %s", e)
 
 
-async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
     if not ALLOWED:
-        await update.message.reply_text("مفيش حد مضاف غيرك.")
+        await update.message.reply_text("مفيش مستخدمين مضافين.")
         return
-    lines = [f"{uid} - {name}" for uid, name in ALLOWED.items()]
-    await update.message.reply_text(
-        "المضافين:\n" + "\n".join(lines) + "\n\nلحذف حد: /remove الرقم"
-    )
+    await update.message.reply_text("\n".join(f"{n} — {i}" for i, n in ALLOWED.items()))
 
 
-async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         return
-    try:
-        target = int(context.args[0])
-    except (IndexError, ValueError):
-        await update.message.reply_text("اكتب كده: /remove الرقم")
+    if not context.args:
+        await update.message.reply_text("اكتب: /remove ID")
         return
-    if ALLOWED.pop(target, None) is None:
-        await update.message.reply_text("الرقم ده مش في القايمة.")
-        return
-    save_users(ALLOWED)
-    asked.discard(target)
-    await update.message.reply_text("اتحذف.")
+    if ALLOWED.pop(context.args[0], None) is not None:
+        save_users(ALLOWED)
+        await update.message.reply_text("تم الحذف ✅")
+    else:
+        await update.message.reply_text("الرقم ده مش في القائمة.")
 
 
-async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not OWNER_ID:
-        await update.message.reply_text(f"رقم حسابك هو: {uid}")
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_allowed(user.id):
+        await update.message.reply_text("مش مسموحلك تستخدم البوت. ابعت /start عشان تطلب الإذن.")
         return
-    if not is_allowed(uid):
-        await update.message.reply_text("البوت ده خاص. ابعت /start عشان تطلب الدخول.")
-        return
-
-    m = URL_RE.search(update.message.text or "")
+    m = re.search(r"https?://\S+", update.message.text or "")
     if not m:
-        await update.message.reply_text("ابعتلي لينك المنتج.")
+        await update.message.reply_text("ابعتلي لينك المنتج من أمازون 🔗")
         return
-    url = m.group().rstrip(").,")
-
-    await update.message.reply_text("ثواني، بجهز البوست...")
-    final, page = await asyncio.to_thread(resolve, url)
-    title, price, old, rating, img_url = read_product(page)
-    if not title:
-        await update.message.reply_text(
-            "معرفتش أقرا بيانات المنتج. جرّب لينك تاني أو حاول بعد شوية."
-        )
-        return
-
-    link = affiliate(final)
-    image = await asyncio.to_thread(download_image, img_url)
-    post = build_post(title, price, old, rating, link)
-
-    pid = uuid.uuid4().hex[:8]
-    context.bot_data.setdefault("pending", {})[pid] = {
-        "uid": uid, "image": image, "post": post,
-    }
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ نشر", callback_data="pub:" + pid),
-        InlineKeyboardButton("❌ إلغاء", callback_data="cancel:" + pid),
-    ]])
-
+    wait = await update.message.reply_text("⏳ بقرا بيانات المنتج...")
     try:
-        await send_post(context.bot, uid, image, post, markup)
+        ok, res = await asyncio.to_thread(process_link, m.group(0).rstrip(").,"))
     except Exception as e:
-        logging.warning("Preview failed: %s", e)
-        context.bot_data["pending"].pop(pid, None)
-        await update.message.reply_text(f"معرفتش أجهز المعاينة: {e}")
+        log.exception("process_link crashed")
+        ok, res = False, f"حصل خطأ غير متوقع: {type(e).__name__}"
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    if not ok:
+        await update.message.reply_text("❌ " + res)
         return
-
-    notes = []
-    if not price:
-        notes.append("مقدرتش أقرا السعر فالبوست من غير سعر.")
-    if not image:
-        notes.append("مقدرتش أجيب الصورة فالبوست من غير صورة.")
-    if notes:
-        await update.message.reply_text(" ".join(notes))
+    pid = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    context.bot_data.setdefault("pending", {})[pid] = {"uid": user.id, "image": res["image"], "post": res["post"]}
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ نشر", callback_data=f"pub:{pid}"),
+            InlineKeyboardButton("❌ إلغاء", callback_data=f"cx:{pid}"),
+        ]]
+    )
+    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], kb)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    await q.answer()
+    action, _, val = (q.data or "").partition(":")
     uid = q.from_user.id
-    action, _, arg = (q.data or "").partition(":")
 
-    # قبول أو رفض طلب دخول (للمسؤول بس)
-    if action in ("approve", "deny"):
+    if action in ("ap", "dn"):
         if uid != OWNER_ID:
-            await q.answer()
             return
-        target = int(arg)
-        await q.edit_message_reply_markup(reply_markup=None)
-        if action == "approve":
-            lines = (q.message.text or "").splitlines()
-            ALLOWED[target] = lines[1] if len(lines) > 1 else str(target)
+        if action == "ap":
+            ALLOWED[val] = q.message.text.split("\n")[1] if q.message and q.message.text else val
             save_users(ALLOWED)
-            await q.answer("تمت الإضافة")
-            await q.message.reply_text("✅ تمت إضافته.")
+            await q.edit_message_text(f"تم قبول المستخدم {val} ✅")
             try:
-                await context.bot.send_message(
-                    target, "تم قبولك. ابعتلي لينك أي منتج وأنا أجهز البوست."
-                )
-            except Exception as e:
-                logging.warning("Could not notify user: %s", e)
+                await context.bot.send_message(int(val), "اتقبلت ✅ ابعتلي لينك منتج أمازون.")
+            except Exception:
+                pass
         else:
-            await q.answer("اترفض")
-            await q.message.reply_text("❌ اترفض.")
+            await q.edit_message_text(f"تم رفض المستخدم {val} ❌")
+            try:
+                await context.bot.send_message(int(val), "للأسف الطلب اترفض.")
+            except Exception:
+                pass
         return
 
-    # نشر أو إلغاء بوست
-    if not is_allowed(uid):
-        await q.answer()
+    pending = context.bot_data.get("pending", {})
+    item = pending.get(val)
+    if not item:
+        await q.message.reply_text("البوست ده انتهى، ابعت اللينك تاني.")
         return
-    pending = context.bot_data.setdefault("pending", {})
-    item = pending.get(arg)
-    if not item or item["uid"] != uid:
-        await q.answer("المعاينة دي خلصت. ابعت اللينك تاني.", show_alert=True)
-        return
-    pending.pop(arg)
-
-    if action == "cancel":
-        await q.answer("اتلغى")
-        await q.edit_message_reply_markup(reply_markup=None)
-        await q.message.reply_text("❌ اتلغى، ومنزلش في القناة.")
+    if uid != item["uid"] and uid != OWNER_ID:
         return
 
-    try:
-        await send_post(context.bot, CHANNEL, item["image"], item["post"])
-    except Exception as e:
-        logging.warning("Post failed: %s", e)
-        pending[arg] = item
-        await q.answer(f"فشل النشر: {e}", show_alert=True)
+    if action == "cx":
+        pending.pop(val, None)
+        await q.message.reply_text("اتلغى ❌")
         return
 
-    await q.answer("تم النشر")
-    await q.edit_message_reply_markup(reply_markup=None)
-    await q.message.reply_text("✅ تم النشر في القناة.")
+    if action == "pub":
+        try:
+            await send_post(context.bot, CHANNEL, item["image"], item["post"])
+            pending.pop(val, None)
+            await q.message.reply_text("اتنشر في القناة ✅")
+        except Exception as e:
+            log.exception("publish failed")
+            await q.message.reply_text(f"معرفتش أنشر: {type(e).__name__}\nتأكد إن البوت أدمن في القناة.")
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.warning("handler error: %s", type(context.error).__name__)
 
 
 def main():
+    if not TOKEN:
+        print("POST_BOT_TOKEN مش موجود. اعمل export الأول.")
+        return
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("users", users_cmd))
-    app.add_handler(CommandHandler("remove", remove_cmd))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    print("Bot is running...")
     app.run_polling()
 
 
