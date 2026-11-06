@@ -1,6 +1,7 @@
 import os
 import re
-import io
+import sys
+import json
 import time
 import html
 import asyncio
@@ -9,12 +10,14 @@ import logging
 from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
-from PIL import Image
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.tl.types import MessageEntityTextUrl
 
+import post_bot as pb
+import draft_bot as db
+
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -27,9 +30,6 @@ FOOTER = (
     "للمزيد من العروض يوميًا:\n"
     "https://t.me/PromoCodeOnlain"
 )
-
-LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
-LOGO_RATIO = 0.22  # حجم الشعار نسبة لعرض الصورة
 
 HEADERS = {
     "User-Agent": (
@@ -79,60 +79,35 @@ def to_my_link(url):
     if not AMAZON_RE.search(url):
         return url
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        final = r.url
-        host = urlparse(final).netloc or "www.amazon.eg"
-        m = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", final)
-        if m:
-            return f"https://{host}/dp/{m.group(1)}?tag={MY_TAG}"
+        final, body = pb.resolve(url, pb.HEADER_STRATEGIES[0])
+        host = urlparse(final).netloc
+        if "amazon." not in host or host.startswith("link."):
+            host = "www.amazon.eg"
+        asin = pb.find_asin(final) or pb.find_asin(url) or pb.find_asin(body)
+        if asin:
+            return f"https://{host}/dp/{asin}?tag={MY_TAG}"
         if "tag=" in final:
             return re.sub(r"([?&])tag=[^&]*", r"\1tag=" + MY_TAG, final)
         sep = "&" if "?" in final else "?"
         return f"{final}{sep}tag={MY_TAG}"
     except Exception as e:
-        logging.warning("Link resolve failed: %s", e)
+        logging.warning("Link resolve failed: %s", type(e).__name__)
         return url
-        def add_logo(data):
-    """يحط الشعار في الركن التحتاني الأيمن. لو حصل أي خطأ بيرجع الصورة زي ما هي."""
-    try:
-        base = Image.open(io.BytesIO(data)).convert("RGBA")
-        logo = Image.open(LOGO_PATH).convert("RGBA")
-        w = max(int(base.width * LOGO_RATIO), 60)
-        h = int(logo.height * w / logo.width)
-        logo = logo.resize((w, h), Image.LANCZOS)
-        margin = int(base.width * 0.03)
-        base.alpha_composite(logo, (base.width - w - margin, base.height - h - margin))
-        out = io.BytesIO()
-        base.convert("RGB").save(out, "JPEG", quality=92)
-        return out.getvalue()
-    except Exception as e:
-        logging.warning("Logo overlay failed: %s", e)
-        return data
 
 
 def get_image(url):
+    """صورة المنتج بنفس شكل post_bot: خلفية بيضاء ومنتج في النص والشعار في الركن."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        soup = BeautifulSoup(r.text, "html.parser")
-        img_url = None
-        tag = soup.find("meta", property="og:image")
-        if tag and tag.get("content"):
-            img_url = tag["content"]
-        if not img_url:
-            img = soup.select_one("#landingImage") or soup.select_one("#imgTagWrapperId img")
-            if img:
-                img_url = img.get("data-old-hires") or img.get("src")
-        if not img_url or not img_url.startswith("http"):
+        if "amazon." not in urlparse(url).netloc:
             return None
-        data = requests.get(img_url, headers=HEADERS, timeout=20).content
-        if len(data) < 2000:
+        _, page = pb.get_page(url, [])
+        if not page:
             return None
-        data = add_logo(data)
-        bio = io.BytesIO(data)
-        bio.name = "product.jpg"
-        return bio
+        img = pb.read_product(page)[4]
+        raw = pb.download_image(img)
+        return pb.prepare_image(raw) if raw else None
     except Exception as e:
-        logging.warning("Image fetch failed: %s", e)
+        logging.warning("Image fetch failed: %s", type(e).__name__)
         return None
 
 
@@ -164,7 +139,54 @@ def build_post(lines, urls):
         parts.append("🛒 اشتري من هنا:\n" + esc(urls[0]))
     parts.append(esc(FOOTER))
     return "\n\n".join(parts)
-    async def main():
+
+
+def api(method, data, files=None):
+    """يرجع message_id لو نجح، أو None."""
+    r = requests.post(
+        f"https://api.telegram.org/bot{db.TOKEN}/{method}",
+        data=data, files=files, timeout=60,
+    )
+    if r.status_code != 200:
+        logging.warning("Bot API %s failed: %s", method, r.text[:200])
+        return None
+    try:
+        return r.json()["result"]["message_id"]
+    except Exception:
+        return True
+
+
+def send_draft(pid, image, post):
+    """يبعت المسودة لقناة المسودات مع أزرار نشر / تعديل / إلغاء. يرجع قايمة الرسايل."""
+    chat = target_box["chat_id"]
+    kb = json.dumps({
+        "inline_keyboard": [
+            [
+                {"text": "✅ نشر", "callback_data": f"pub:{pid}"},
+                {"text": "✏️ تعديل", "callback_data": f"ed:{pid}"},
+            ],
+            [{"text": "❌ إلغاء", "callback_data": f"cx:{pid}"}],
+        ]
+    })
+    base = {"chat_id": chat, "parse_mode": "HTML"}
+    sent = []
+    if image and len(post) <= 1000:
+        mid = api("sendPhoto", {**base, "caption": post, "reply_markup": kb},
+                  {"photo": ("product.jpg", image)})
+        return [[chat, mid]] if mid else None
+    if image:
+        m1 = api("sendPhoto", {"chat_id": chat}, {"photo": ("product.jpg", image)})
+        if m1:
+            sent.append([chat, m1])
+    m2 = api("sendMessage", {**base, "text": post, "reply_markup": kb,
+                             "disable_web_page_preview": "true"})
+    if not m2:
+        return None
+    sent.append([chat, m2])
+    return sent
+
+
+async def main():
     client = TelegramClient(
         "session", API_ID, API_HASH,
         connection_retries=None, retry_delay=5, auto_reconnect=True,
@@ -172,10 +194,6 @@ def build_post(lines, urls):
 
     @client.on(events.NewMessage(chats=SOURCES))
     async def handler(event):
-        target = target_box.get("entity")
-        if target is None:
-            return
-
         msg = event.message
         raw = msg.message or ""
 
@@ -209,17 +227,17 @@ def build_post(lines, urls):
         if uniq:
             image = await asyncio.to_thread(get_image, uniq[0])
 
+        pid = db.new_pid()
         try:
-            if image and len(post) <= 1000:
-                await client.send_message(target, post, file=image, parse_mode="html")
-            elif image:
-                await client.send_message(target, "", file=image)
-                await client.send_message(target, post, parse_mode="html", link_preview=False)
+            db.store_draft(pid, image, post)
+            sent = await asyncio.to_thread(send_draft, pid, image, post)
+            if sent:
+                db.set_src(pid, sent)
+                logging.info("Draft sent: %s", lines[0][:40])
             else:
-                await client.send_message(target, post, parse_mode="html", link_preview=False)
-            logging.info("Posted: %s", lines[0][:40])
+                db.drop_draft(pid)
         except Exception as e:
-            logging.warning("Failed to post: %s", e)
+            logging.warning("Failed to send draft: %s", type(e).__name__)
         await asyncio.sleep(3)
 
     await client.start()
@@ -228,15 +246,19 @@ def build_post(lines, urls):
     async for d in client.iter_dialogs():
         names.append(d.name)
         if d.name == PRIVATE_TITLE:
-            target_box["entity"] = d.entity
+            target_box["chat_id"] = utils.get_peer_id(d.entity)
             break
-    if "entity" not in target_box:
+    if "chat_id" not in target_box:
         logging.error("Channel '%s' not found. Your chats: %s", PRIVATE_TITLE, names[:15])
         return
 
-    logging.info("Running. Posting to private channel: %s", PRIVATE_TITLE)
+    logging.info("Running. Drafts go to: %s (with buttons)", PRIVATE_TITLE)
     await client.run_until_disconnected()
 
+
+if not db.TOKEN:
+    print("لازم تعمل export لـ DRAFT_BOT_TOKEN الأول.")
+    sys.exit(1)
 
 while True:
     try:
@@ -245,5 +267,5 @@ while True:
     except KeyboardInterrupt:
         break
     except Exception as e:
-        logging.warning("Stopped: %s. Restarting in 30 seconds...", e)
+        logging.warning("Stopped: %s. Restarting in 30 seconds...", type(e).__name__)
         time.sleep(30)
