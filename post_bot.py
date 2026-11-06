@@ -178,8 +178,14 @@ def get_page(url, debug):
 
 
 def clean_title(t):
-    t = re.sub(r"^\s*(Amazon\.eg|Amazon\.com|أمازون)\s*[:：\-]\s*", "", t or "", flags=re.I)
-    return re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+", " ", t or "").strip()
+    pat = r"\s*[:：|\-–]?\s*(?:amazon\.[a-z.]+|أمازون)"
+    m = re.search(pat, t, flags=re.I)
+    if m:
+        before = t[: m.start()].strip(" :：|-–")
+        t = before if before else re.sub(pat, " ", t, flags=re.I)
+    t = re.sub(r"amazon", "", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip(" :：|-–")
 
 
 def read_product(page):
@@ -335,8 +341,6 @@ def build_post(title, price, old, rating, link):
         if old:
             pct = round((old - price) / old * 100)
             lines.append(f"🏷️ كان: <s>{fmt(old)}</s> (خصم {pct}%)")
-    if rating:
-        lines.append(f"⭐ التقييم: {rating} من 5")
     lines += ["", "🛒 اشتري من هنا:", link, "", random.choice(CLOSERS), ""]
     lines += ["📢 قناة عروض وخصومات", "للمزيد من العروض يوميًا:", CHANNEL_LINK]
     return "\n".join(lines)
