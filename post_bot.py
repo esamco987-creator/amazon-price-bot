@@ -7,7 +7,7 @@ import random
 import string
 import asyncio
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -247,6 +247,25 @@ def read_product(page):
         og = soup.find("meta", property="og:image")
         if og and og.get("content"):
             img = og["content"]
+    if not img:
+        for sel in ("#imgTagWrapperId img", "#main-image", "#ebooksImgBlkFront", "img[data-old-hires]"):
+            t = soup.select_one(sel)
+            if t:
+                img = t.get("data-old-hires") or t.get("src") or ""
+                if img.startswith("http"):
+                    break
+                img = ""
+    if not img:
+        for pat in (r'"hiRes"\s*:\s*"(https:[^"]+)"', r'"large"\s*:\s*"(https:[^"]+)"'):
+            m = re.search(pat, page)
+            if m:
+                img = m.group(1).replace("\\/", "/")
+                break
+    if not img:
+        for m in re.finditer(r"https://m\.media-amazon\.com/images/I/[A-Za-z0-9%+_-]{8,}[^\"'\s\\<>]*?\.(?:jpg|jpeg|png)", page):
+            if "sprite" not in m.group(0) and "pixel" not in m.group(0):
+                img = m.group(0)
+                break
 
     return title, price, old, rating, img
 
@@ -339,30 +358,51 @@ async def send_post(bot, chat_id, image, post, markup=None):
 
 
 # ---------------------------------------------------------------- product pipeline
+def resolve(url, headers):
+    """Follow redirects by hand; tolerate non-http redirect targets."""
+    cur = url
+    body = ""
+    for _ in range(10):
+        r = requests.get(cur, headers=headers, timeout=25, allow_redirects=False)
+        body = r.text or ""
+        loc = r.headers.get("Location")
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            nxt = urljoin(cur, loc)
+            if not nxt.lower().startswith(("http://", "https://")):
+                m = re.search(r"https?://[^\s\"']+", unquote(loc))
+                if not m:
+                    return cur, body
+                nxt = m.group(0)
+            cur = nxt
+            continue
+        break
+    return cur, body
+
+
 def process_link(url):
     """Blocking. Returns (ok, data_or_message)."""
     debug = []
-    try:
-        r = requests.get(url, headers=HEADER_STRATEGIES[0], timeout=25, allow_redirects=True)
-        final = r.url
-    except Exception as e:
-        return False, f"مقدرتش أفتح الرابط ({type(e).__name__})."
+    final, body, asin = url, "", None
+    for headers in HEADER_STRATEGIES:
+        try:
+            final, body = resolve(url, headers)
+        except Exception as e:
+            debug.append(f"فتح الرابط: {type(e).__name__}")
+            continue
+        asin = find_asin(final) or find_asin(url) or find_asin(body)
+        if asin:
+            break
+    if not asin:
+        return False, "معرفتش أوصل لصفحة المنتج من الرابط ده.\n" + "\n".join(debug)
 
     host = urlparse(final).netloc.lower()
-    if not is_amazon_host(host):
-        return False, "البوت بيشتغل مع روابط أمازون بس دلوقتي."
-    if "amazon" not in host:
+    if "amazon." not in host or host.startswith("link."):
         host = "www.amazon.eg"
 
-    asin = find_asin(final) or find_asin(url) or find_asin(r.text)
-    target = f"https://{host}/dp/{asin}" if asin else final
+    target = f"https://{host}/dp/{asin}"
     final_url, page = get_page(target, debug)
     if not page:
         return False, "أمازون مردتش على البوت.\n" + "\n".join(debug)
-    if not asin:
-        asin = find_asin(final_url) or find_asin(page)
-    if not asin:
-        return False, "معرفتش ألاقي كود المنتج (ASIN) في الرابط."
 
     title, price, old, rating, img = read_product(page)
     log.info("parsed title=%s price=%s old=%s rating=%s img=%s", bool(title), price, old, rating, bool(img))
