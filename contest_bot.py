@@ -112,12 +112,30 @@ async def is_member(bot, uid):
     return m.status in ("member", "administrator", "creator", "restricted")
 
 
-def contest_text(c):
+def remaining_text(ts):
+    secs = max(0, int(ts - time.time()))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    if days:
+        return f"{days} يوم و{hours} ساعة"
+    if hours:
+        return f"{hours} ساعة"
+    return f"{max(1, rem // 60)} دقيقة"
+
+
+def contest_text(c, reminder=False):
+    extra = ""
+    if reminder:
+        extra = (
+            f"⏳ باقي: {remaining_text(c['end_ts'])}\n"
+            f"🔥 المشاركين لحد دلوقتي: {len(c['entries'])}\n"
+        )
     return (
         "🎁 <b>مسابقة جديدة!</b>\n\n"
         f"🏆 الجايزة: <b>{html.escape(c['prize'])}</b>\n"
         f"👥 عدد الفايزين: {c['winners']}\n"
-        f"⏰ آخر معاد: {fmt_time(c['end_ts'])}\n\n"
+        f"⏰ آخر معاد: {fmt_time(c['end_ts'])}\n"
+        f"{extra}\n"
         "📋 طريقة المشاركة:\n"
         "1️⃣ اشترك في قناة عروض وخصومات\n"
         "2️⃣ دوس على زر \"🎁 شارك دلوقتي\" تحت\n"
@@ -133,6 +151,29 @@ def join_kb(username, cid):
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🎁 شارك دلوقتي", url=f"https://t.me/{username}?start=c{cid}")]]
     )
+
+
+async def post_contest(bot, cid, repost=False):
+    """ينشر المسابقة في القناة. لو إعادة نشر بيمسح البوست القديم."""
+    c = DB["contests"][str(cid)]
+    me = await bot.get_me()
+    msg = await bot.send_message(
+        CHANNEL,
+        contest_text(c, reminder=repost),
+        parse_mode=ParseMode.HTML,
+        reply_markup=join_kb(me.username, cid),
+        disable_web_page_preview=True,
+    )
+    old = c.get("chan_msg")
+    c["chan_msg"] = [msg.chat_id, msg.message_id]
+    c["last_post_ts"] = time.time()
+    save_db()
+    if repost and old:
+        try:
+            await bot.delete_message(old[0], old[1])
+        except Exception:
+            pass
+    return msg
 
 
 def me_kb(cid):
@@ -329,11 +370,22 @@ async def finish_contest(app, cid):
 async def check_job(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     for cid, c in list(DB["contests"].items()):
-        if c["status"] == "open" and c["end_ts"] <= now:
+        if c["status"] != "open":
+            continue
+        if c["end_ts"] <= now:
             try:
                 await finish_contest(context.application, cid)
             except Exception as e:
                 log.warning("finish failed: %s", type(e).__name__)
+            continue
+        rh = c.get("repeat_hours") or 0
+        if rh and c["end_ts"] - now > 900 and now - c.get("last_post_ts", now) >= rh * 3600:
+            try:
+                await post_contest(context.bot, cid, repost=True)
+            except Exception as e:
+                log.warning("auto repost failed: %s", type(e).__name__)
+                c["last_post_ts"] = now
+                save_db()
 
 
 # ---------------------------------------------------------------- owner
@@ -341,6 +393,8 @@ HELP = (
     "أهلاً يا صاحب القناة 👋\n\n"
     "/new — مسابقة جديدة\n"
     "/list — المسابقات المفتوحة\n"
+    "/repost رقم — نشر المسابقة تاني في القناة دلوقتي\n"
+    "/auto رقم ساعات — نشرها تاني تلقائي كل كام ساعة (0 للإيقاف)\n"
     "/end رقم — إنهاء مسابقة دلوقتي وسحب الفايزين\n"
     "/cancel رقم — إلغاء مسابقة من غير سحب"
 )
@@ -385,6 +439,50 @@ async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("جاري سحب الفايزين...")
     await finish_contest(context.application, context.args[0])
+
+
+@owner_only
+async def cmd_repost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("اكتب كده: /repost 1")
+        return
+    c = DB["contests"].get(context.args[0])
+    if not c or c["status"] != "open":
+        await update.message.reply_text("المسابقة دي مش مفتوحة.")
+        return
+    try:
+        await post_contest(context.bot, context.args[0], repost=True)
+    except Exception as e:
+        log.warning("repost failed: %s", type(e).__name__)
+        await update.message.reply_text("معرفتش أنشر في القناة. تأكد إن البوت أدمن فيها.")
+        return
+    await update.message.reply_text("اتنشرت تاني في القناة ✅ والبوست القديم اتمسح.")
+
+
+@owner_only
+async def cmd_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "اكتب كده: /auto رقم_المسابقة عدد_الساعات\nمثال: /auto 1 6\nولإيقاف التكرار: /auto 1 0"
+        )
+        return
+    c = DB["contests"].get(context.args[0])
+    if not c or c["status"] != "open":
+        await update.message.reply_text("المسابقة دي مش مفتوحة.")
+        return
+    h = parse_number(context.args[1])
+    if h is None or h < 0 or (0 < h < 1):
+        await update.message.reply_text("اكتب عدد ساعات صح (1 أو أكتر)، أو 0 للإيقاف.")
+        return
+    c["repeat_hours"] = h
+    c.setdefault("last_post_ts", time.time())
+    save_db()
+    if h == 0:
+        await update.message.reply_text("اتوقف التكرار التلقائي.")
+    else:
+        await update.message.reply_text(
+            f"تمام ✅ هنزّل المسابقة تاني تلقائي كل {h:g} ساعة لحد ما تخلص، ويتمسح البوست القديم كل مرة."
+        )
 
 
 @owner_only
@@ -480,6 +578,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "nw" and user.id == OWNER_ID:
         st = context.user_data.get("new")
         if not st or st.get("step") != "confirm":
+            await q.message.reply_text(
+                "المسابقة دي اتنشرت قبل كده. لو عايز تنزلها تاني ابعت: /repost رقم_المسابقة\n"
+                "(ولو مش فاكر الرقم ابعت /list)"
+            )
             return
         context.user_data.pop("new", None)
         if rest == "no":
@@ -498,16 +600,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         DB["contests"][str(cid)] = c
         try:
-            msg = await context.bot.send_message(
-                CHANNEL,
-                contest_text(c),
-                parse_mode=ParseMode.HTML,
-                reply_markup=join_kb(context.bot_data["username"], cid),
-                disable_web_page_preview=True,
+            await post_contest(context.bot, cid)
+            await q.message.reply_text(
+                f"اتنشرت المسابقة رقم {cid} في القناة ✅\n\n"
+                f"لو عايز تنزلها تاني كل فترة: /auto {cid} 6 (كل 6 ساعات)\n"
+                f"أو انشرها تاني دلوقتي: /repost {cid}"
             )
-            c["chan_msg"] = [msg.chat_id, msg.message_id]
-            save_db()
-            await q.message.reply_text(f"اتنشرت المسابقة رقم {cid} في القناة ✅")
         except Exception as e:
             DB["contests"].pop(str(cid), None)
             DB["next"] = cid
@@ -538,6 +636,8 @@ def main():
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("end", cmd_end))
+    app.add_handler(CommandHandler("repost", cmd_repost))
+    app.add_handler(CommandHandler("auto", cmd_auto))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
