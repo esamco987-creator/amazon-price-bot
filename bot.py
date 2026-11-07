@@ -1,157 +1,286 @@
 import os
 import re
+import json
 import time
 import asyncio
 import logging
 import threading
+from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import requests
-from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-logging.basicConfig(level=logging.INFO)
+import post_bot as pb  # نفس دوال قراءة أمازون الشغالة في بوت البوستات
 
-TOKEN = os.environ["BOT_TOKEN"]
-CHECK_EVERY = 3600  # كل ساعة
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+for _n in ("httpx", "httpcore", "telegram", "apscheduler", "urllib3"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
+log = logging.getLogger("price_bot")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-    ),
-    "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
-}
+TOKEN = os.environ.get("BOT_TOKEN", "")
+CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "3600"))  # كل ساعة
+AFFILIATE_TAG = "mixdeals-21"  # اللينك في التنبيه بيبقى بكودك. امسحه لو مش عايز: ""
+MAX_ITEMS = 25  # أقصى عدد منتجات لكل شخص
 
-PRICE_SELECTORS = [
-    "#corePrice_feature_div span.a-offscreen",
-    "span.a-price span.a-offscreen",
-    "#priceblock_ourprice",
-    "#priceblock_dealprice",
-    "#price_inside_buybox",
-]
-
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE, "tracked.json")
+URL_RE = re.compile(r"https?://\S+")
 AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
 
-tracked = {}
+lock = threading.Lock()
 
 
-def parse_price(text):
-    text = text.translate(AR_DIGITS).replace(",", "")
-    digits = re.sub(r"[^\d.]", "", text)
+# ---------------------------------------------------------------- storage
+def load():
     try:
-        return float(digits)
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save():
+    tmp = DATA_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(tracked, f, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
+    except Exception as e:
+        log.warning("save failed: %s", type(e).__name__)
+
+
+tracked = load()  # {chat_id: [ {asin, host, title, target, last, lowest, notified}, ... ]}
+
+
+# ---------------------------------------------------------------- amazon
+def num(text):
+    m = re.search(r"\d[\d,]*\.?\d*", (text or "").translate(AR_DIGITS))
+    if not m:
+        return None
+    try:
+        v = float(m.group(0).replace(",", ""))
     except ValueError:
         return None
+    return v if v > 0 else None
 
 
-def get_product(url):
-    for attempt in range(3):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        except requests.RequestException as e:
-            logging.warning("Request failed: %s", e)
-            time.sleep(2)
-            continue
+def link_for(p):
+    base = f"https://{p['host']}/dp/{p['asin']}"
+    return f"{base}?tag={AFFILIATE_TAG}" if AFFILIATE_TAG else base
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        title_tag = soup.select_one("#productTitle")
-        if not title_tag:
-            page_title = soup.title.get_text(strip=True) if soup.title else None
-            logging.warning(
-                "No product title (status %s, page: %s)", r.status_code, page_title
-            )
-            time.sleep(3)
-            continue
 
-        title = title_tag.get_text(strip=True)
-        for sel in PRICE_SELECTORS:
-            tag = soup.select_one(sel)
-            if tag:
-                price = parse_price(tag.get_text())
-                if price:
-                    return title, price
-        logging.warning("No price found for: %s", title[:40])
-        return title, None
-    return None, None
+def fetch_product(url, debug):
+    """يرجع dict فيه asin/host/title/price أو None."""
+    try:
+        final, body = pb.resolve(url, pb.HEADER_STRATEGIES[0])
+    except Exception as e:
+        debug.append(f"فتح الرابط: {type(e).__name__}")
+        return None
+    host = urlparse(final).netloc.lower()
+    asin = pb.find_asin(final) or pb.find_asin(url) or pb.find_asin(body)
+    if not asin:
+        return None
+    if "amazon." not in host or host.startswith("link."):
+        host = "www.amazon.eg"
+    return fetch_by_asin(host, asin, debug)
+
+
+def fetch_by_asin(host, asin, debug):
+    _, page = pb.get_page(f"https://{host}/dp/{asin}", debug)
+    if not page:
+        return None
+    title, price, old, rating, img = pb.read_product(page)
+    if not title:
+        return None
+    return {"asin": asin, "host": host, "title": title, "price": price}
+
+
+# ---------------------------------------------------------------- commands
+HELP = (
+    "أهلاً! أنا بوت تتبع أسعار أمازون 📉\n\n"
+    "ابعتلي رابط المنتج وبعده السعر المطلوب (من غير /track):\n"
+    "https://www.amazon.eg/dp/XXXX 1500\n"
+    "هبلغك لما السعر ينزل لـ 1500 أو أقل.\n\n"
+    "ولو بعت الرابط من غير سعر، هبلغك مع أي نزول في السعر.\n\n"
+    "/list — المنتجات اللي بتتابعها\n"
+    "/check — افحص الأسعار دلوقتي\n"
+    "/remove رقم — احذف منتج"
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلا! أنا بوت تتبع أسعار أمازون.\n\n"
-        "/track الرابط السعر_المطلوب\n"
-        "مثال:\n/track https://www.amazon.eg/dp/XXXX 1500\n\n"
-        "/list لعرض المنتجات\n"
-        "/remove رقم لحذف منتج"
-    )
+    await update.message.reply_text(HELP)
 
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("اكتب كده:\n/track الرابط السعر_المطلوب")
+    await do_track(update, " ".join(context.args))
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رابط من غير /track."""
+    await do_track(update, update.message.text or "")
+
+
+async def do_track(update: Update, text):
+    m = URL_RE.search(text)
+    if not m:
+        await update.message.reply_text(
+            "ابعتلي رابط المنتج من أمازون، وممكن تكتب بعده السعر المطلوب.\n"
+            "مثال: https://www.amazon.eg/dp/XXXX 1500"
+        )
         return
-    url = context.args[0]
-    try:
-        target = float(context.args[1])
-    except ValueError:
-        await update.message.reply_text("السعر لازم يكون رقم.")
+    url = m.group(0).rstrip(").,")
+    target = num(URL_RE.sub("", text))
+
+    chat = str(update.effective_chat.id)
+    items = tracked.setdefault(chat, [])
+    if len(items) >= MAX_ITEMS:
+        await update.message.reply_text(f"وصلت للحد الأقصى ({MAX_ITEMS} منتج). احذف منتج الأول بـ /remove.")
         return
 
     await update.message.reply_text("ثواني، بقرا المنتج...")
-    title, price = await asyncio.to_thread(get_product, url)
-    if title is None or price is None:
+    debug = []
+    prod = await asyncio.to_thread(fetch_product, url, debug)
+    if not prod:
         await update.message.reply_text(
-            "معرفتش أقرا السعر. ممكن المنتج مش متوفر دلوقتي، أو أمازون منعت الطلب. جرب بعد شوية."
+            "معرفتش أقرا المنتج من الرابط ده. اتأكد إنه رابط منتج من أمازون وجرب تاني.\n" + "\n".join(debug)
         )
         return
+    if prod["price"] is None:
+        await update.message.reply_text(
+            f"{prod['title'][:80]}\nالمنتج ده مفيش له سعر دلوقتي (غالبًا مش متوفر). جرب لما يتوفر."
+        )
+        return
+    if any(p["asin"] == prod["asin"] and p["host"] == prod["host"] for p in items):
+        await update.message.reply_text("المنتج ده بتتابعه بالفعل.")
+        return
 
-    chat_id = update.effective_chat.id
-    tracked.setdefault(chat_id, []).append(
-        {"url": url, "title": title, "target": target, "last": price}
-    )
+    item = {
+        "asin": prod["asin"],
+        "host": prod["host"],
+        "title": prod["title"],
+        "target": target,
+        "last": prod["price"],
+        "lowest": prod["price"],
+        "notified": False,
+    }
+    with lock:
+        items.append(item)
+        save()
+    when = f"لما ينزل لـ {pb.fmt(target)} أو أقل" if target else "مع أي نزول في السعر"
     await update.message.reply_text(
-        f"تمام، بتابع:\n{title[:80]}\nالسعر دلوقتي: {price}\nهبلغك لما ينزل لـ {target} أو أقل."
+        f"تمام، بتابع:\n{prod['title'][:80]}\nالسعر دلوقتي: {pb.fmt(prod['price'])}\nهبلغك {when} ✅"
     )
+    if target and prod["price"] <= target:
+        await update.message.reply_text("ملحوظة: السعر دلوقتي أقل من المطلوب أصلًا 👀\n" + link_for(item))
 
 
 async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = tracked.get(update.effective_chat.id, [])
+    items = tracked.get(str(update.effective_chat.id), [])
     if not items:
         await update.message.reply_text("مفيش منتجات بتتابعها.")
         return
-    lines = [
-        f"{i}. {p['title'][:50]}\n   الحالي: {p['last']} | المطلوب: {p['target']}"
-        for i, p in enumerate(items, 1)
-    ]
+    lines = []
+    for i, p in enumerate(items, 1):
+        want = pb.fmt(p["target"]) if p["target"] else "أي نزول"
+        lines.append(
+            f"{i}. {p['title'][:50]}\n"
+            f"   الحالي: {pb.fmt(p['last'])} | الأقل: {pb.fmt(p['lowest'])} | المطلوب: {want}"
+        )
     await update.message.reply_text("\n\n".join(lines))
 
 
 async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = tracked.get(update.effective_chat.id, [])
+    items = tracked.get(str(update.effective_chat.id), [])
     try:
-        n = int(context.args[0]) - 1
-        removed = items.pop(n)
+        n = int(context.args[0].translate(AR_DIGITS)) - 1
+        if n < 0:
+            raise IndexError
+        with lock:
+            removed = items.pop(n)
+            save()
         await update.message.reply_text(f"اتحذف: {removed['title'][:50]}")
     except (IndexError, ValueError):
-        await update.message.reply_text("اكتب رقم صح، مثال: /remove 1")
+        await update.message.reply_text("اكتب رقم صح من /list، مثال: /remove 1")
+
+
+async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = str(update.effective_chat.id)
+    if not tracked.get(chat):
+        await update.message.reply_text("مفيش منتجات بتتابعها.")
+        return
+    await update.message.reply_text("بفحص الأسعار...")
+    await check_chat(context.bot, chat, always_report=True)
+
+
+# ---------------------------------------------------------------- price checks
+def decide(p, price):
+    """يرجع (هل نبلّغ؟). ويحدّث حالة المنتج."""
+    notify = False
+    if p["target"]:
+        if price <= p["target"]:
+            if not p.get("notified") or price < p["last"]:
+                notify = True
+            p["notified"] = True
+        else:
+            p["notified"] = False
+    elif price < p["last"]:
+        notify = True
+    p["lowest"] = min(p.get("lowest", price), price)
+    return notify
+
+
+async def check_chat(bot, chat, always_report=False):
+    items = tracked.get(chat, [])
+    for p in list(items):
+        try:
+            prod = await asyncio.to_thread(fetch_by_asin, p["host"], p["asin"], [])
+        except Exception as e:
+            log.warning("check failed: %s", type(e).__name__)
+            prod = None
+        price = prod["price"] if prod else None
+        if price is None:
+            if always_report:
+                await bot.send_message(int(chat), f"{p['title'][:50]}\nمقدرتش أجيب سعره دلوقتي.")
+            await asyncio.sleep(4)
+            continue
+        old = p["last"]
+        notify = decide(p, price)
+        p["last"] = price
+        with lock:
+            save()
+        if notify:
+            drop = ""
+            if price < old:
+                drop = f" (نزل {round((old - price) / old * 100)}%)"
+            try:
+                await bot.send_message(
+                    int(chat),
+                    f"📉 السعر نزل!\n{p['title'][:80]}\n"
+                    f"كان: {pb.fmt(old)}\nدلوقتي: {pb.fmt(price)}{drop}\n\n{link_for(p)}",
+                )
+            except Exception as e:
+                log.warning("notify failed: %s", type(e).__name__)
+        elif always_report:
+            await bot.send_message(int(chat), f"{p['title'][:50]}\nالسعر: {pb.fmt(price)}")
+        await asyncio.sleep(4)
 
 
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
-    for chat_id, items in tracked.items():
-        for p in items:
-            title, price = await asyncio.to_thread(get_product, p["url"])
-            if price is None:
-                continue
-            p["last"] = price
-            if price <= p["target"]:
-                await context.bot.send_message(
-                    chat_id,
-                    f"السعر نزل!\n{p['title'][:80]}\nالسعر: {price}\n{p['url']}",
-                )
-            await asyncio.sleep(3)
+    for chat in list(tracked.keys()):
+        try:
+            await check_chat(context.bot, chat)
+        except Exception as e:
+            log.warning("chat check failed: %s", type(e).__name__)
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.warning("handler error: %s", type(context.error).__name__)
+
+
+# ---------------------------------------------------------------- server (للاستضافة بس)
 class Ping(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -163,19 +292,30 @@ class Ping(BaseHTTPRequestHandler):
 
 
 def run_server():
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ["PORT"])
     HTTPServer(("0.0.0.0", port), Ping).serve_forever()
 
 
 def main():
-    threading.Thread(target=run_server, daemon=True).start()
+    if not TOKEN:
+        print("BOT_TOKEN مش موجود. اعمل export الأول.")
+        return
+    if os.environ.get("PORT"):
+        threading.Thread(target=run_server, daemon=True).start()
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(TOKEN).build()
+    if app.job_queue is None:
+        print("job-queue مش متثبتة. نفّذ: pip install 'python-telegram-bot[job-queue]'")
+        return
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("track", track))
     app.add_handler(CommandHandler("list", list_items))
     app.add_handler(CommandHandler("remove", remove))
+    app.add_handler(CommandHandler("check", check))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     app.job_queue.run_repeating(check_prices, interval=CHECK_EVERY, first=60)
+    print("Price bot is running...")
     app.run_polling()
 
 
