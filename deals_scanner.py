@@ -20,6 +20,8 @@ CLIENT_ID = os.environ.get("CREATORS_ID", "")
 CLIENT_SECRET = os.environ.get("CREATORS_SECRET", "")
 VERSION = os.environ.get("CREATORS_VERSION", "3.2")
 
+LANG = os.environ.get("SCAN_LANG", "ar_AE")  # لغة العناوين. اكتب en_AE للإنجليزي، أو فاضي لو مش مدعومة
+
 MARKETPLACE = "www.amazon.eg"
 PARTNER_TAG = "mixdeals-21"
 API_URL = "https://creatorsapi.amazon/catalog/v1/searchItems"
@@ -47,6 +49,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 SENT_FILE = os.path.join(BASE, "scanner_sent.json")
 
 _token = {"value": None, "exp": 0}
+_lang = {"on": True}
 
 
 def enabled():
@@ -99,7 +102,15 @@ def search(keyword, page=1):
         "Content-Type": "application/json",
         "x-marketplace": MARKETPLACE,
     }
+    if _lang["on"] and LANG:
+        body["languagesOfPreference"] = [LANG]
     r = requests.post(API_URL, json=body, headers=headers, timeout=40)
+    if r.status_code != 200 and "languagesOfPreference" in body and "lang" in r.text.lower():
+        # اللغة مش مدعومة: كمّل من غيرها
+        log.warning("language %s not accepted, continuing without it: %s", LANG, r.text[:150])
+        _lang["on"] = False
+        body.pop("languagesOfPreference", None)
+        r = requests.post(API_URL, json=body, headers=headers, timeout=40)
     if r.status_code != 200:
         raise RuntimeError(f"search status {r.status_code}: {r.text[:200]}")
     return r.json()
