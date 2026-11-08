@@ -216,10 +216,27 @@ def is_new(sent, item):
 
 
 # ---------------------------------------------------------------- post
-def build_deal_post(item):
+def build_deal_post(item, compact=False):
     hot = item["pct"] >= HOT_DISCOUNT
     head = f"🚨 خصم {item['pct']}% — عرض ممتاز ما يتفوتش!" if hot else f"🔥 خصم {item['pct']}%"
     link = pb.affiliate(MARKETPLACE, item["asin"])
+    if compact:
+        # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
+        return "\n".join(
+            [
+                head,
+                f"{pb.fmt(item['price'])} بدل {pb.fmt(item['old'])}",
+                "",
+                "🛒 اشتري من هنا:",
+                link,
+                "",
+                "⏳ السعر والكمية ممكن يتغيروا في أي وقت.",
+                "",
+                "📢 قناة عروض وخصومات",
+                "للمزيد من العروض يوميًا:",
+                pb.CHANNEL_LINK,
+            ]
+        )
     return "\n".join(
         [
             head,
@@ -274,11 +291,15 @@ def scan_once():
     results = []
     for it in best:
         image = None
+        card = False
         if it["image"]:
             raw_img = pb.download_image(it["image"])
             if raw_img:
-                image = deal_card.make_card(it, raw_img) or pb.prepare_image(raw_img)
-        results.append((it, build_deal_post(it), image))
+                image = deal_card.make_card(it, raw_img)
+                card = bool(image)
+                if not image:
+                    image = pb.prepare_image(raw_img)
+        results.append((it, build_deal_post(it, compact=card), image))
         sent[it["asin"]] = {"price": it["price"], "ts": time.time()}
     save_sent(sent)
     msg = f"scan: keywords={used} with_discount={raw} already_sent={skipped} new={len(results)} errors={len(errors)}"
