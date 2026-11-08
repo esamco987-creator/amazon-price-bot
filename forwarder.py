@@ -104,9 +104,9 @@ def get_image(url):
         _, page = pb.get_page(url, [])
         if not page:
             return None
-        img = pb.read_product(page)[4]
+        title, price, old, _, img = pb.read_product(page)
         raw = pb.download_image(img)
-        return pb.prepare_image(raw) if raw else None
+        return pb.product_image(title, price, old, raw)
     except Exception as e:
         logging.warning("Image fetch failed: %s", type(e).__name__)
         return None
@@ -185,6 +185,22 @@ def send_draft(pid, image, post):
         return None
     sent.append([chat, m2])
     return sent
+
+
+def check_admin():
+    """يتأكد إن بوت المسودات أدمن في القناة الأساسية (لازم عشان زر النشر)."""
+    try:
+        base = f"https://api.telegram.org/bot{db.TOKEN}"
+        me = requests.get(base + "/getMe", timeout=30).json()["result"]["id"]
+        r = requests.get(base + "/getChatMember", params={"chat_id": db.CHANNEL, "user_id": me}, timeout=30).json()
+        st = (r.get("result") or {}).get("status")
+        can = (r.get("result") or {}).get("can_post_messages")
+        if st == "administrator" and can:
+            logging.info("Publish check OK: البوت أدمن في %s", db.CHANNEL)
+        else:
+            logging.error("زر النشر مش هيشتغل: البوت مش أدمن بصلاحية Post Messages في %s (الحالة: %s)", db.CHANNEL, st or r.get("description"))
+    except Exception as e:
+        logging.warning("admin check failed: %s", type(e).__name__)
 
 
 async def scan_loop():
@@ -273,6 +289,11 @@ async def main():
         logging.error("Channel '%s' not found. Your chats: %s", PRIVATE_TITLE, names[:15])
         return
 
+    if not db.OWNER_ID:
+        logging.error("OWNER_ID مش متظبط. اعمل export لـ OWNER_ID (رقمك من @myidbot) وشغل تاني.")
+        return
+    db.start_background()
+    await asyncio.to_thread(check_admin)
     logging.info("Running. Drafts go to: %s (with buttons)", PRIVATE_TITLE)
     if scanner.enabled():
         target_box["scan_task"] = asyncio.create_task(scan_loop())
