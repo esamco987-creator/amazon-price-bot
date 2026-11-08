@@ -411,6 +411,10 @@ def prepare_image(data):
         return None
 
 
+# True = بوست مختصر تحت الكارت. False = البوست الكامل (العنوان والسعر والخصم) زي الأول.
+COMPACT_POST = False
+
+
 def product_card(title, price, old, raw):
     """كارت العرض لو فيه خصم، وإلا None."""
     if not raw or not (price and old and old > price):
@@ -531,7 +535,7 @@ def process_link(url):
     raw = download_image(img)
     card = product_card(title, price, old, raw)
     image = card or (prepare_image(raw) if raw else None)
-    post = build_post(title, price, old, rating, link, compact=bool(card))
+    post = build_post(title, price, old, rating, link, compact=COMPACT_POST and bool(card))
     return True, {"image": image, "post": post, "price": price}
 
 
