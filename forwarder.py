@@ -215,11 +215,14 @@ async def scan_loop():
                 sent = await asyncio.to_thread(send_draft, pid, image, post)
                 if sent:
                     db.set_src(pid, sent)
+                    scanner.note(f"draft sent: {item['asin']} -{item['pct']}%")
                 else:
                     db.drop_draft(pid)
+                    scanner.note(f"draft FAILED to send: {item['asin']}")
                 await asyncio.sleep(3)
         except Exception as e:
             logging.warning("scan loop error: %s", type(e).__name__)
+            scanner.note(f"scan loop error: {type(e).__name__} {str(e)[:150]}")
         await asyncio.sleep(scanner.SCAN_EVERY)
 
 
