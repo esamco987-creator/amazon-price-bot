@@ -13,6 +13,7 @@ import random
 import requests
 
 import post_bot as pb
+import deal_card
 
 log = logging.getLogger("scanner")
 
@@ -55,6 +56,7 @@ SENT_FILE = os.path.join(BASE, "scanner_sent.json")
 
 _token = {"value": None, "exp": 0}
 _lang = {"on": True}
+_deal = {"on": True}
 
 
 def enabled():
@@ -102,6 +104,8 @@ def search(keyword, page=1):
             "offersV2.listings.isBuyBoxWinner",
         ],
     }
+    if _deal["on"]:
+        body["resources"].append("offersV2.listings.dealDetails")
     headers = {
         "Authorization": f"Bearer {get_token()}",
         "Content-Type": "application/json",
@@ -115,6 +119,11 @@ def search(keyword, page=1):
         log.warning("language %s not accepted, continuing without it: %s", LANG, r.text[:150])
         _lang["on"] = False
         body.pop("languagesOfPreference", None)
+        r = requests.post(API_URL, json=body, headers=headers, timeout=40)
+    if r.status_code != 200 and _deal["on"] and "dealDetails" in r.text:
+        log.warning("dealDetails not accepted, continuing without it: %s", r.text[:150])
+        _deal["on"] = False
+        body["resources"] = [x for x in body["resources"] if "dealDetails" not in x]
         r = requests.post(API_URL, json=body, headers=headers, timeout=40)
     if r.status_code != 200:
         raise RuntimeError(f"search status {r.status_code}: {r.text[:200]}")
@@ -144,8 +153,10 @@ def parse_items(data):
             if not title or float(basis) <= float(price):
                 continue
             image = (((it.get("images") or {}).get("primary") or {}).get("large") or {}).get("url")
+            badge = ((lst.get("dealDetails") or {}).get("badge")) or ""
             out.append(
                 {
+                    "badge": badge,
                     "asin": it["asin"],
                     "title": title,
                     "price": float(price),
@@ -191,7 +202,7 @@ def is_new(sent, item):
 # ---------------------------------------------------------------- post
 def build_deal_post(item):
     hot = item["pct"] >= HOT_DISCOUNT
-    head = f"🚨 خصم {item['pct']}% — عرض نار!" if hot else f"🔥 خصم {item['pct']}%"
+    head = f"🚨 خصم {item['pct']}% — عرض ممتاز ما يتفوتش!" if hot else f"🔥 خصم {item['pct']}%"
     link = pb.affiliate(MARKETPLACE, item["asin"])
     return "\n".join(
         [
@@ -237,7 +248,9 @@ def scan_once():
         image = None
         if it["image"]:
             raw = pb.download_image(it["image"])
-            image = pb.prepare_image(raw) if raw else None
+            image = None
+            if raw:
+                image = deal_card.make_card(it, raw) or pb.prepare_image(raw)
         results.append((it, build_deal_post(it), image))
         sent[it["asin"]] = {"price": it["price"], "ts": time.time()}
     save_sent(sent)
