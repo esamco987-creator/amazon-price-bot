@@ -18,6 +18,14 @@ except Exception:  # المكتبات مش متثبتة
     arabic_reshaper = None
     get_display = None
 
+try:
+    from PIL import features as _features
+    HAS_RAQM = bool(_features.check("raqm"))
+except Exception:
+    HAS_RAQM = False
+# لو Pillow عنده raqm بيشكّل العربي لوحده صح. الطريقة التانية (reshaper + bidi) احتياطي.
+USE_MANUAL = (not HAS_RAQM) and bool(arabic_reshaper and get_display)
+
 log = logging.getLogger("card")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -77,14 +85,14 @@ def ensure_font():
 def font(size):
     # لو احنا اللي بنشكّل العربي (reshaper + bidi) لازم نقفل تشكيل Pillow الداخلي،
     # وإلا الحروف بتتشكّل مرتين وتطلع مقلوبة ومفكوكة.
-    if arabic_reshaper and get_display:
+    if USE_MANUAL:
         return ImageFont.truetype(ensure_font(), size, layout_engine=ImageFont.Layout.BASIC)
     return ImageFont.truetype(ensure_font(), size)
 
 
 def shape(text):
     """يجهّز النص العربي للرسم (تشكيل الحروف + اتجاه من اليمين)."""
-    if arabic_reshaper and get_display:
+    if USE_MANUAL:
         return get_display(arabic_reshaper.reshape(text))
     return text
 
@@ -119,8 +127,7 @@ def wrap(draw, text, f, max_w, max_lines):
 
 
 def money(v):
-    s = f"{v:,.2f}".rstrip("0").rstrip(".") if v != int(v) else f"{int(v):,}"
-    return s
+    return f"{int(v):,}" if v == int(v) else f"{v:,.2f}"
 
 
 EVENT_LABEL = "عرض خاص"   # الشارة العادية
