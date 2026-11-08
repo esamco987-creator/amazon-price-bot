@@ -75,6 +75,10 @@ def ensure_font():
 
 
 def font(size):
+    # لو احنا اللي بنشكّل العربي (reshaper + bidi) لازم نقفل تشكيل Pillow الداخلي،
+    # وإلا الحروف بتتشكّل مرتين وتطلع مقلوبة ومفكوكة.
+    if arabic_reshaper and get_display:
+        return ImageFont.truetype(ensure_font(), size, layout_engine=ImageFont.Layout.BASIC)
     return ImageFont.truetype(ensure_font(), size)
 
 
