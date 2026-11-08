@@ -32,6 +32,8 @@ TOKEN_URLS = {
     "3.3": "https://api.amazon.co.jp/auth/o2/token",
 }
 
+# True = بوست مختصر تحت الكارت. False = البوست الكامل زي الأول.
+COMPACT_POST = False
 MIN_DISCOUNT = 25          # أقل نسبة خصم
 HOT_DISCOUNT = 50          # من النسبة دي العرض بيتعلّم "نار"
 SCAN_EVERY = 20 * 60       # كل قد إيه يعيد الفحص (ثواني)
@@ -299,7 +301,7 @@ def scan_once():
                 card = bool(image)
                 if not image:
                     image = pb.prepare_image(raw_img)
-        results.append((it, build_deal_post(it, compact=card), image))
+        results.append((it, build_deal_post(it, compact=COMPACT_POST and card), image))
         sent[it["asin"]] = {"price": it["price"], "ts": time.time()}
     save_sent(sent)
     msg = f"scan: keywords={used} with_discount={raw} already_sent={skipped} new={len(results)} errors={len(errors)}"
