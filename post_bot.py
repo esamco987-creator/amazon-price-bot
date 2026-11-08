@@ -102,6 +102,90 @@ def save_users(data):
 
 ALLOWED = load_users()
 
+DRAFTS = os.path.join(BASE, "drafts")
+PID_RE = re.compile(r"[a-z0-9]{8}")
+
+
+def new_pid():
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+
+
+def _dpath(pid, ext):
+    return os.path.join(DRAFTS, f"{pid}.{ext}")
+
+
+def store_draft(pid, uid, image, post, src=None):
+    os.makedirs(DRAFTS, exist_ok=True)
+    with open(_dpath(pid, "json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {"uid": uid, "post": post, "image": bool(image), "src": src or []},
+            f,
+            ensure_ascii=False,
+        )
+    if image:
+        with open(_dpath(pid, "jpg"), "wb") as f:
+            f.write(image)
+
+
+def load_draft(pid):
+    if not PID_RE.fullmatch(pid or ""):
+        return None
+    try:
+        with open(_dpath(pid, "json"), "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    img = None
+    if d.get("image"):
+        try:
+            with open(_dpath(pid, "jpg"), "rb") as f:
+                img = f.read()
+        except Exception:
+            img = None
+    d["image"] = img
+    return d
+
+
+def set_src(pid, src):
+    """يحفظ أماكن رسايل المسودة في قناة المسودات عشان تتمسح بعد النشر."""
+    d = load_draft(pid)
+    if d:
+        store_draft(pid, d["uid"], d["image"], d["post"], src)
+
+
+async def clear_src(bot, item):
+    for chat, mid in item.get("src") or []:
+        try:
+            await bot.delete_message(chat, mid)
+        except Exception:
+            pass
+
+
+def drop_draft(pid):
+    if not PID_RE.fullmatch(pid or ""):
+        return
+    for ext in ("json", "jpg"):
+        try:
+            os.remove(_dpath(pid, ext))
+        except OSError:
+            pass
+
+
+def plain(post):
+    return html.unescape(re.sub(r"<[^>]+>", "", post))
+
+
+def make_kb(pid):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ نشر", callback_data=f"pub:{pid}"),
+                InlineKeyboardButton("✏️ تعديل", callback_data=f"ed:{pid}"),
+            ],
+            [InlineKeyboardButton("❌ إلغاء", callback_data=f"cx:{pid}")],
+        ]
+    )
+
 
 def is_allowed(uid):
     return uid == OWNER_ID or str(uid) in ALLOWED
@@ -327,6 +411,25 @@ def prepare_image(data):
         return None
 
 
+def product_image(title, price, old, raw):
+    """كارت العرض (لو فيه خصم) وإلا الصورة العادية على خلفية بيضاء."""
+    if not raw:
+        return None
+    try:
+        if price and old and old > price:
+            pct = int(round((old - price) / old * 100))
+            if pct >= 1:
+                import deal_card
+                card = deal_card.make_card(
+                    {"title": title, "price": price, "old": old, "pct": pct}, raw
+                )
+                if card:
+                    return card
+    except Exception as e:
+        log.warning("card failed: %s", type(e).__name__)
+    return prepare_image(raw)
+
+
 def short_title(t, limit=95):
     t = re.sub(r"\s+", " ", t).strip()
     if len(t) <= limit:
@@ -415,7 +518,7 @@ def process_link(url):
 
     link = affiliate(host, asin)
     raw = download_image(img)
-    image = prepare_image(raw) if raw else None
+    image = product_image(title, price, old, raw)
     post = build_post(title, price, old, rating, link)
     return True, {"image": image, "post": post, "price": price}
 
@@ -473,6 +576,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(user.id):
         await update.message.reply_text("مش مسموحلك تستخدم البوت. ابعت /start عشان تطلب الإذن.")
         return
+    editing = context.bot_data.setdefault("editing", {})
+    if user.id in editing:
+        pid = editing.pop(user.id)
+        txt = (update.message.text or "").strip()
+        item = load_draft(pid)
+        if not item:
+            await update.message.reply_text("البوست ده انتهى.")
+            return
+        if txt in ("إلغاء", "الغاء"):
+            await update.message.reply_text("اتلغى التعديل. البوست القديم لسه موجود.")
+            return
+        post = html.escape(txt)
+        store_draft(pid, item["uid"], item["image"], post, item.get("src"))
+        await send_post(context.bot, update.effective_chat.id, item["image"], post, make_kb(pid))
+        return
     m = re.search(r"https?://\S+", update.message.text or "")
     if not m:
         await update.message.reply_text("ابعتلي لينك المنتج من أمازون 🔗")
@@ -490,15 +608,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ok:
         await update.message.reply_text("❌ " + res)
         return
-    pid = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    context.bot_data.setdefault("pending", {})[pid] = {"uid": user.id, "image": res["image"], "post": res["post"]}
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✅ نشر", callback_data=f"pub:{pid}"),
-            InlineKeyboardButton("❌ إلغاء", callback_data=f"cx:{pid}"),
-        ]]
-    )
-    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], kb)
+    pid = new_pid()
+    store_draft(pid, user.id, res["image"], res["post"])
+    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -526,27 +638,41 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    pending = context.bot_data.get("pending", {})
-    item = pending.get(val)
+    async def say(text, **kw):
+        try:
+            await context.bot.send_message(uid, text, **kw)
+        except Exception as e:
+            log.warning("say failed: %s", type(e).__name__)
+
+    item = load_draft(val)
     if not item:
-        await q.message.reply_text("البوست ده انتهى، ابعت اللينك تاني.")
+        await say("البوست ده انتهى، ابعت اللينك تاني.")
         return
     if uid != item["uid"] and uid != OWNER_ID:
         return
 
     if action == "cx":
-        pending.pop(val, None)
-        await q.message.reply_text("اتلغى ❌")
+        await clear_src(context.bot, item)
+        drop_draft(val)
+        await say("اتلغى ❌")
+        return
+
+    if action == "ed":
+        context.bot_data.setdefault("editing", {})[uid] = val
+        await say(plain(item["post"]), disable_web_page_preview=True)
+        await say("✏️ انسخ النص اللي فوق، عدّل عليه، وابعته هنا.\nعشان تلغي التعديل ابعت: إلغاء")
         return
 
     if action == "pub":
         try:
             await send_post(context.bot, CHANNEL, item["image"], item["post"])
-            pending.pop(val, None)
-            await q.message.reply_text("اتنشر في القناة ✅")
         except Exception as e:
             log.exception("publish failed")
-            await q.message.reply_text(f"معرفتش أنشر: {type(e).__name__}\nتأكد إن البوت أدمن في القناة.")
+            await say(f"معرفتش أنشر: {type(e).__name__}\nتأكد إن البوت أدمن في القناة.")
+            return
+        await clear_src(context.bot, item)
+        drop_draft(val)
+        await say("اتنشر في القناة ✅")
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
