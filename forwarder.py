@@ -15,6 +15,7 @@ from telethon.tl.types import MessageEntityTextUrl
 
 import post_bot as pb
 import draft_bot as db
+import deals_scanner as scanner
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -186,6 +187,26 @@ def send_draft(pid, image, post):
     return sent
 
 
+async def scan_loop():
+    """يدوّر على خصومات كبيرة كل فترة ويبعتها كمسودات."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            results = await asyncio.to_thread(scanner.scan_once)
+            for item, post, image in results:
+                pid = db.new_pid()
+                db.store_draft(pid, image, post)
+                sent = await asyncio.to_thread(send_draft, pid, image, post)
+                if sent:
+                    db.set_src(pid, sent)
+                else:
+                    db.drop_draft(pid)
+                await asyncio.sleep(3)
+        except Exception as e:
+            logging.warning("scan loop error: %s", type(e).__name__)
+        await asyncio.sleep(scanner.SCAN_EVERY)
+
+
 async def main():
     client = TelegramClient(
         "session", API_ID, API_HASH,
@@ -253,6 +274,11 @@ async def main():
         return
 
     logging.info("Running. Drafts go to: %s (with buttons)", PRIVATE_TITLE)
+    if scanner.enabled():
+        target_box["scan_task"] = asyncio.create_task(scan_loop())
+        logging.info("Deal scanner on: discount >= %s%% every %s min", scanner.MIN_DISCOUNT, scanner.SCAN_EVERY // 60)
+    else:
+        logging.info("Deal scanner off (CREATORS_ID / CREATORS_SECRET not set)")
     await client.run_until_disconnected()
 
 
