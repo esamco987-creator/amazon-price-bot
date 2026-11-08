@@ -411,23 +411,26 @@ def prepare_image(data):
         return None
 
 
+def product_card(title, price, old, raw):
+    """كارت العرض لو فيه خصم، وإلا None."""
+    if not raw or not (price and old and old > price):
+        return None
+    try:
+        pct = int(round((old - price) / old * 100))
+        if pct < 1:
+            return None
+        import deal_card
+        return deal_card.make_card({"title": title, "price": price, "old": old, "pct": pct}, raw)
+    except Exception as e:
+        log.warning("card failed: %s", type(e).__name__)
+        return None
+
+
 def product_image(title, price, old, raw):
     """كارت العرض (لو فيه خصم) وإلا الصورة العادية على خلفية بيضاء."""
     if not raw:
         return None
-    try:
-        if price and old and old > price:
-            pct = int(round((old - price) / old * 100))
-            if pct >= 1:
-                import deal_card
-                card = deal_card.make_card(
-                    {"title": title, "price": price, "old": old, "pct": pct}, raw
-                )
-                if card:
-                    return card
-    except Exception as e:
-        log.warning("card failed: %s", type(e).__name__)
-    return prepare_image(raw)
+    return product_card(title, price, old, raw) or prepare_image(raw)
 
 
 def short_title(t, limit=95):
@@ -437,7 +440,15 @@ def short_title(t, limit=95):
     return t[:limit].rsplit(" ", 1)[0] + "…"
 
 
-def build_post(title, price, old, rating, link):
+def build_post(title, price, old, rating, link, compact=False):
+    if compact and price and old and old > price:
+        # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
+        pct = round((old - price) / old * 100)
+        return "\n".join([
+            f"🔥 خصم {pct}% — {fmt(price)} بدل {fmt(old)}",
+            "", "🛒 اشتري من هنا:", link, "", random.choice(CLOSERS), "",
+            "📢 قناة عروض وخصومات", "للمزيد من العروض يوميًا:", CHANNEL_LINK,
+        ])
     lines = [random.choice(OPENERS), "", f"<b>{html.escape(short_title(title))}</b>", ""]
     if price:
         lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
@@ -518,8 +529,9 @@ def process_link(url):
 
     link = affiliate(host, asin)
     raw = download_image(img)
-    image = product_image(title, price, old, raw)
-    post = build_post(title, price, old, rating, link)
+    card = product_card(title, price, old, raw)
+    image = card or (prepare_image(raw) if raw else None)
+    post = build_post(title, price, old, rating, link, compact=bool(card))
     return True, {"image": image, "post": post, "price": price}
 
 
