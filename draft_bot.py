@@ -139,7 +139,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, _, val = (q.data or "").partition(":")
     uid = q.from_user.id
     if uid != OWNER_ID:
-        await q.answer()
+        await q.answer("مش مسموحلك تستخدم الزرار ده.", show_alert=True)
         return
     if action != "ed":
         await q.answer()
@@ -243,16 +243,39 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     log.warning("handler error: %s", type(context.error).__name__)
 
 
-def main():
-    if not TOKEN or not OWNER_ID:
-        print("لازم تعمل export لـ DRAFT_BOT_TOKEN و OWNER_ID الأول.")
-        return
-    asyncio.set_event_loop(asyncio.new_event_loop())
+def build_app():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
+    return app
+
+
+def start_background():
+    """بيشغّل استقبال ضغطات الأزرار جوه نفس برنامج forwarder (من غير ما تشغّل draft_bot لوحده)."""
+    import threading
+
+    def run():
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        try:
+            app = build_app()
+            log.info("Draft buttons are listening (publish / edit / cancel)")
+            app.run_polling(stop_signals=None, close_loop=False)
+        except Exception as e:
+            log.error("draft buttons stopped: %s %s", type(e).__name__, e)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t
+
+
+def main():
+    if not TOKEN or not OWNER_ID:
+        print("لازم تعمل export لـ DRAFT_BOT_TOKEN و OWNER_ID الأول.")
+        return
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    app = build_app()
     print("Draft bot is running...")
     app.run_polling()
 
