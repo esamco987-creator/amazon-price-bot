@@ -49,6 +49,12 @@ KEYWORDS = [
     "ملابس رجالي", "ملابس نسائي", "ملابس أطفال", "حذاء", "نظارة", "ساعة يد",
     "مكياج", "عناية بالبشرة", "شامبو", "فيتامينات", "حفاضات", "ألعاب أطفال",
     "أدوات مطبخ", "مفروشات", "إضاءة", "عدة", "دراجة", "حقيبة ظهر",
+    "سماعة بلوتوث", "سماعة رأس", "كشاف", "كاميرا مراقبة", "ميزان", "فرن كهربائي",
+    "عصارة", "غلاية", "محمصة", "مجفف شعر", "ماكينة حلاقة", "فرشاة أسنان كهربائية",
+    "مستحضرات تجميل", "كريم", "صبغة شعر", "مزيل عرق", "منظف", "مناديل",
+    "أثاث", "مرتبة", "وسادة", "ستائر", "سجاد", "حقيبة سفر", "ساعة رياضية",
+    "ملابس رياضية", "جاكيت", "شنطة", "حذاء رجالي", "حذاء نسائي", "لعبة", "ليجو",
+    "كتب", "قرطاسية", "ذاكرة", "هارد ديسك", "كارت ذاكرة", "كابل", "شاشة كمبيوتر",
 ]
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -242,13 +248,13 @@ def scan_once():
     found = {}
     used = raw = skipped = 0
     errors = []
-    # لو الدفعة الأولى مجبتش حاجة جديدة، كمّل بدفعات تانية (لحد 3 دفعات)
-    for batch in range(3):
+    # لو الدفعة الأولى مجبتش حاجة جديدة، كمّل بدفعات تانية (لحد 4 دفعات)
+    for batch in range(4):
         kws = pool[batch * KEYWORDS_PER_ROUND:(batch + 1) * KEYWORDS_PER_ROUND]
         for kw in kws:
             used += 1
             try:
-                data = search(kw)
+                data = search(kw, random.choice([1, 1, 2, 3]))
             except Exception as e:
                 errors.append(f"{kw}: {str(e)[:120]}")
                 log.warning("search '%s' failed: %s", kw, e)
@@ -261,7 +267,7 @@ def scan_once():
                 else:
                     skipped += 1
             time.sleep(2)
-        if found:
+        if len(found) >= max(3, MAX_PER_ROUND // 2):
             break
 
     best = sorted(found.values(), key=lambda x: x["pct"], reverse=True)[:MAX_PER_ROUND]
