@@ -53,10 +53,20 @@ KEYWORDS = [
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SENT_FILE = os.path.join(BASE, "scanner_sent.json")
+LOG_FILE = os.path.join(BASE, "scan_log.txt")
 
 _token = {"value": None, "exp": 0}
 _lang = {"on": True}
 _deal = {"on": True}
+
+
+def note(msg):
+    """سطر في ملف scan_log.txt عشان نعرف الفحص عمل إيه."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
 
 
 def enabled():
@@ -228,31 +238,46 @@ def build_deal_post(item):
 def scan_once():
     """جولة فحص واحدة. يرجع قايمة (item, post_html, image_bytes)."""
     sent = load_sent()
-    kws = random.sample(KEYWORDS, min(KEYWORDS_PER_ROUND, len(KEYWORDS)))
+    pool = random.sample(KEYWORDS, len(KEYWORDS))
     found = {}
-    for kw in kws:
-        try:
-            data = search(kw)
-        except Exception as e:
-            log.warning("search '%s' failed: %s", kw, e)
-            time.sleep(3)
-            continue
-        for it in parse_items(data):
-            if it["pct"] >= MIN_DISCOUNT and is_new(sent, it):
-                found.setdefault(it["asin"], it)
-        time.sleep(2)
+    used = raw = skipped = 0
+    errors = []
+    # لو الدفعة الأولى مجبتش حاجة جديدة، كمّل بدفعات تانية (لحد 3 دفعات)
+    for batch in range(3):
+        kws = pool[batch * KEYWORDS_PER_ROUND:(batch + 1) * KEYWORDS_PER_ROUND]
+        for kw in kws:
+            used += 1
+            try:
+                data = search(kw)
+            except Exception as e:
+                errors.append(f"{kw}: {str(e)[:120]}")
+                log.warning("search '%s' failed: %s", kw, e)
+                time.sleep(3)
+                continue
+            for it in parse_items(data):
+                raw += 1
+                if it["pct"] >= MIN_DISCOUNT and is_new(sent, it):
+                    found.setdefault(it["asin"], it)
+                else:
+                    skipped += 1
+            time.sleep(2)
+        if found:
+            break
 
     best = sorted(found.values(), key=lambda x: x["pct"], reverse=True)[:MAX_PER_ROUND]
     results = []
     for it in best:
         image = None
         if it["image"]:
-            raw = pb.download_image(it["image"])
-            image = None
-            if raw:
-                image = deal_card.make_card(it, raw) or pb.prepare_image(raw)
+            raw_img = pb.download_image(it["image"])
+            if raw_img:
+                image = deal_card.make_card(it, raw_img) or pb.prepare_image(raw_img)
         results.append((it, build_deal_post(it), image))
         sent[it["asin"]] = {"price": it["price"], "ts": time.time()}
     save_sent(sent)
-    log.info("scan: keywords=%s found=%s", len(kws), len(results))
+    msg = f"scan: keywords={used} with_discount={raw} already_sent={skipped} new={len(results)} errors={len(errors)}"
+    if errors:
+        msg += " | " + " || ".join(errors[:3])
+    log.info(msg)
+    note(msg)
     return results
