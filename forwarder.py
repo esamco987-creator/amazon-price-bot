@@ -350,9 +350,8 @@ async def main():
         logging.info("Deal scanner on: discount >= %s%% every %s min", scanner.MIN_DISCOUNT, scanner.SCAN_EVERY // 60)
     else:
         logging.info("Deal scanner off (CREATORS_ID / CREATORS_SECRET not set)")
-    if promos.enabled():
-        target_box["promo_task"] = asyncio.create_task(promo_loop())
-        logging.info("Promo pages scanner on: every %s h", promos.SCAN_EVERY // 3600)
+    # سحب صفحات العروض (اشتري 3 بسعر 2...) موقوف بقرار صاحب القناة
+    logging.info("Promo pages scanner off")
     await client.run_until_disconnected()
 
 
