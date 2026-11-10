@@ -237,7 +237,7 @@ def build_deal_post(item, compact=False):
                 "📢 قناة عروض وخصومات",
                 "للمزيد من العروض يوميًا:",
                 pb.CHANNEL_LINK,
-            ]
+            ] + pb.BOT_LINE
         )
     return "\n".join(
         [
@@ -256,7 +256,7 @@ def build_deal_post(item, compact=False):
             "📢 قناة عروض وخصومات",
             "للمزيد من العروض يوميًا:",
             pb.CHANNEL_LINK,
-        ]
+        ] + pb.BOT_LINE
     )
 
 
