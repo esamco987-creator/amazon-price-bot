@@ -38,7 +38,8 @@ CHANNEL = "@PromoCodeOnlain"
 MY_TAG = "mixdeals-21"
 CHANNEL_LINK = "https://t.me/PromoCodeOnlain"
 SEARCH_BOT_LINK = "https://t.me/Mix_Compare_bot"
-BOT_LINE = ["", "🔎 دوّر على أي منتج وشوف أحسن سعر:", SEARCH_BOT_LINK]
+BOT_LINE = []  # (قديم) السطر بقى جوه FOOTER_LINES
+FOOTER_LINES = ["📢 للمزيد من العروض: t.me/PromoCodeOnlain", "🔎 دوّر على أي منتج: t.me/Mix_Compare_bot"]
 BASE = os.path.dirname(os.path.abspath(__file__))
 USERS_FILE = os.path.join(BASE, "allowed_users.json")
 LOGO_FILE = os.path.join(BASE, "logo.png")
@@ -452,17 +453,16 @@ def build_post(title, price, old, rating, link, compact=False):
         pct = round((old - price) / old * 100)
         return "\n".join([
             f"🔥 خصم {pct}% — {fmt(price)} بدل {fmt(old)}",
-            "", "🛒 اشتري من هنا:", link, "", random.choice(CLOSERS), "",
-            "📢 قناة عروض وخصومات", "للمزيد من العروض يوميًا:", CHANNEL_LINK,
-        ] + BOT_LINE)
+            "", "🛒 اشتري من هنا:", link, "",
+        ] + FOOTER_LINES)
     lines = [random.choice(OPENERS), "", f"<b>{html.escape(short_title(title))}</b>", ""]
     if price:
         lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
         if old:
             pct = round((old - price) / old * 100)
             lines.append(f"🏷️ كان: <s>{fmt(old)}</s> (خصم {pct}%)")
-    lines += ["", "🛒 اشتري من هنا:", link, "", random.choice(CLOSERS), ""]
-    lines += ["📢 قناة عروض وخصومات", "للمزيد من العروض يوميًا:", CHANNEL_LINK] + BOT_LINE
+    lines += ["", "🛒 اشتري من هنا:", link, ""]
+    lines += FOOTER_LINES
     return "\n".join(lines)
 
 
