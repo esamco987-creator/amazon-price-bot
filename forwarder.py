@@ -103,25 +103,19 @@ def to_my_link(url):
 
 def promo_image(url, fallback_title):
     """كولاج من منتجات صفحة عرض (اشتري 3 بسعر 2 ...) مع عنوان العرض."""
-    final, body = promos.fetch(url)
-    if not body:
+    info = promos.load_promo(url)
+    if not info or not info["products"]:
         return None
-    asins = promos.extract_asins(body)
-    title, dates = promos.promo_info(body)
     imgs = []
-    for asin in asins[:8]:
+    for p in info["products"][:8]:
         if len(imgs) >= 4:
             break
-        _, page = pb.get_page(f"https://www.amazon.eg/dp/{asin}", [])
-        if not page:
-            continue
-        img = pb.read_product(page)[4]
-        raw = pb.download_image(img) if img else None
+        raw = pb.download_image(p["image"]) if p.get("image") else None
         if raw:
             imgs.append(raw)
     if not imgs:
         return None
-    return deal_card.make_promo_card(title or fallback_title or "عرض خاص", imgs, dates)
+    return deal_card.make_promo_card(info["title"] or fallback_title or "عرض خاص", imgs, info["dates"])
 
 
 def get_image(url, fallback_title=None):
