@@ -612,6 +612,7 @@ def main():
         raise SystemExit("SEARCH_BOT_TOKEN مش موجود")
     if not OWNER_ID:
         raise SystemExit("OWNER_ID مش موجود")
+    asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
