@@ -16,6 +16,7 @@ from telethon.tl.types import MessageEntityTextUrl
 import post_bot as pb
 import draft_bot as db
 import deals_scanner as scanner
+import promo_scanner as promos
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -226,6 +227,29 @@ async def scan_loop():
         await asyncio.sleep(scanner.SCAN_EVERY)
 
 
+async def promo_loop():
+    """يقرا صفحات عروض أمازون (اشتري 3 بسعر 2 ...) ويبعت منتجاتها كمسودات."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            results = await asyncio.to_thread(promos.scan_once)
+            for item, post, image in results:
+                pid = db.new_pid()
+                db.store_draft(pid, image, post)
+                sent = await asyncio.to_thread(send_draft, pid, image, post)
+                if sent:
+                    db.set_src(pid, sent)
+                    promos.note(f"draft sent: {item['asin']}")
+                else:
+                    db.drop_draft(pid)
+                    promos.note(f"draft FAILED to send: {item['asin']}")
+                await asyncio.sleep(3)
+        except Exception as e:
+            logging.warning("promo loop error: %s", type(e).__name__)
+            promos.note(f"promo loop error: {type(e).__name__} {str(e)[:150]}")
+        await asyncio.sleep(promos.SCAN_EVERY)
+
+
 async def main():
     client = TelegramClient(
         "session", API_ID, API_HASH,
@@ -303,6 +327,9 @@ async def main():
         logging.info("Deal scanner on: discount >= %s%% every %s min", scanner.MIN_DISCOUNT, scanner.SCAN_EVERY // 60)
     else:
         logging.info("Deal scanner off (CREATORS_ID / CREATORS_SECRET not set)")
+    if promos.enabled():
+        target_box["promo_task"] = asyncio.create_task(promo_loop())
+        logging.info("Promo pages scanner on: every %s h", promos.SCAN_EVERY // 3600)
     await client.run_until_disconnected()
 
 
