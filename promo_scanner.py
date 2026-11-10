@@ -100,12 +100,12 @@ def fetch(url):
 
 
 ASIN_PATTERNS = [
-    r'data-asin=["\']([A-Z0-9]{10})["\']',
+    # data-asin="B0.." أو data-asin=\"B0..\" أو "asin":"B0.." (حتى لو الاقتباس متهرّب بـ \)
+    r'asin[\W_]{1,8}([A-Z0-9]{10})(?![A-Za-z0-9])',
     r'amzn1\.asin\.([A-Z0-9]{10})',
     r'/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})',
-    r'["\']asin["\']\s*[:=]\s*["\']([A-Z0-9]{10})["\']',
-    r'\basin=([A-Z0-9]{10})',
 ]
+ASIN_OK = re.compile(r"B0[A-Z0-9]{8}")
 
 
 def extract_asins(body):
@@ -114,7 +114,7 @@ def extract_asins(body):
     for p in ASIN_PATTERNS:
         for m in re.finditer(p, body, flags=re.I):
             a = m.group(1).upper()
-            if re.fullmatch(r"[A-Z0-9]{10}", a) and re.search(r"\d", a):
+            if ASIN_OK.fullmatch(a):
                 hits.append((m.start(), a))
     hits.sort()
     found = []
@@ -127,10 +127,11 @@ def extract_asins(body):
 def diagnose(body):
     """معلومات تساعدنا نفهم شكل الصفحة لو مفيش منتجات."""
     low = body.lower()
+    i = low.find("data-asin")
+    sample = repr(body[max(0, i - 5): i + 45]) if i >= 0 else "-"
     return (
         f"len={len(body)} data-asin={low.count('data-asin')} dp={low.count('/dp/')} "
-        f"asin={low.count('asin')} captcha={'captcha' in low} "
-        f"robot={'robot' in low} json={low.count('application/json')} next={'__next' in low}"
+        f"asin={low.count('asin')} captcha={'captcha' in low} sample={sample}"
     )
 
 
