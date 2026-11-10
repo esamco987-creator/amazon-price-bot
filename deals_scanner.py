@@ -234,10 +234,7 @@ def build_deal_post(item, compact=False):
                 "",
                 "⏳ السعر والكمية ممكن يتغيروا في أي وقت.",
                 "",
-                "📢 قناة عروض وخصومات",
-                "للمزيد من العروض يوميًا:",
-                pb.CHANNEL_LINK,
-            ] + pb.BOT_LINE
+            ] + pb.FOOTER_LINES
         )
     return "\n".join(
         [
@@ -253,10 +250,7 @@ def build_deal_post(item, compact=False):
             "",
             "⏳ السعر والكمية ممكن يتغيروا في أي وقت.",
             "",
-            "📢 قناة عروض وخصومات",
-            "للمزيد من العروض يوميًا:",
-            pb.CHANNEL_LINK,
-        ] + pb.BOT_LINE
+        ] + pb.FOOTER_LINES
     )
 
 
