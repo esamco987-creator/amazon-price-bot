@@ -326,3 +326,49 @@ def make_promo_card(title, images, dates=None):
     except Exception as e:
         log.warning("promo card failed: %s %s", type(e).__name__, e)
         return None
+
+
+def make_announce_card(bot_name="@Mix_Compare_bot", sample="سماعة ريدمي بودز 5"):
+    """كارت إعلان محرك البحث (للبوست المثبّت في القناة). يرجع JPEG بايتات أو None."""
+    try:
+        if not ensure_font():
+            return None
+        card = Image.new("RGB", (W, H), WHITE)
+        d = ImageDraw.Draw(card)
+        d.rectangle([0, 0, W, 16], fill=NAVY)
+        d.rectangle([0, 16, W, 22], fill=YELLOW)
+        rx = W - 70
+
+        lt = "جديد"
+        lf = font(36)
+        lw = int(width(d, lt, lf)) + 48
+        d.rounded_rectangle([rx - lw, 58, rx, 112], radius=10, fill=CRIMSON)
+        draw_text(d, (rx - lw // 2, 85), lt, lf, WHITE, "mm")
+
+        draw_text(d, (rx, 135), "ابحث عن أي منتج", font(96), NAVY, "ra")
+        draw_text(d, (rx, 262), "وشوف أحسن سعر وخصم عليه على أمازون", font(44), MUTED, "ra")
+
+        # مربع بحث
+        bx0, by0, bx1, by1 = 70, 360, W - 70, 470
+        d.rounded_rectangle([bx0, by0, bx1, by1], radius=55, fill=(244, 245, 250), outline=(205, 208, 222), width=4)
+        draw_text(d, (bx1 - 40, (by0 + by1) // 2), sample, font(46), (120, 124, 140), "rm")
+        cx, cy = bx0 + 70, (by0 + by1) // 2 - 6
+        d.ellipse([cx - 22, cy - 22, cx + 22, cy + 22], outline=NAVY, width=8)
+        d.line([cx + 16, cy + 16, cx + 42, cy + 42], fill=NAVY, width=9)
+
+        # زر البوت
+        bf = font(54)
+        label = bot_name
+        tw = int(d.textlength(label, font=bf)) + 90
+        mid = W // 2
+        d.rounded_rectangle([mid - tw // 2, 520, mid + tw // 2, 620], radius=22, fill=YELLOW)
+        d.text((mid, 570), label, font=bf, fill=NAVY, anchor="mm")
+        draw_text(d, (mid, 660), "للمشتركين في القناة بس • مجاني", font(34), MUTED, "mm")
+
+        _footer(card, d)
+        out = io.BytesIO()
+        card.save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        log.warning("announce card failed: %s %s", type(e).__name__, e)
+        return None
