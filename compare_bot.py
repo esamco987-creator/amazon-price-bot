@@ -315,10 +315,12 @@ def search_noon(q):
 
 # لإضافة موقع جديد: ضيف سطر هنا ودالة بحث بنفس الشكل (ترجع قايمة dict: title, price, old, image, rating, url)
 STORES = [
-    {"key": "amazon", "name": "أمازون", "emoji": "🟠", "fn": search_amazon},
-    {"key": "noon", "name": "نون", "emoji": "🟡", "fn": search_noon},
-    {"key": "jumia", "name": "جوميا", "emoji": "🟣", "fn": search_jumia},
+    {"key": "amazon", "name": "أمازون", "emoji": "🟠", "fn": search_amazon, "on": True},
+    # نون وجوميا بيقفلوا الاتصال من الموبايل دلوقتي. غيّر False لـ True لما نلاقي حل.
+    {"key": "noon", "name": "نون", "emoji": "🟡", "fn": search_noon, "on": False},
+    {"key": "jumia", "name": "جوميا", "emoji": "🟣", "fn": search_jumia, "on": False},
 ]
+ACTIVE = [x for x in STORES if x.get("on")]
 
 
 # ---------------------------------------------------------------- search + matching
@@ -354,7 +356,7 @@ async def search_all(query):
         except asyncio.TimeoutError:
             note(f"{store['key']}: '{query}' TIMEOUT")
             return {"store": store, "items": [], "error": "timeout"}
-    res = await asyncio.gather(*[run(s) for s in STORES])
+    res = await asyncio.gather(*[run(s) for s in ACTIVE])
     for r in res:
         r["top"], r["sure"], r["ordered"] = pick(query, r["items"])
     return res
@@ -377,7 +379,60 @@ async def cached_search(query):
 
 
 # ---------------------------------------------------------------- rendering
+RANKS = ["2️⃣", "3️⃣"]
+
+
+def link(url, text):
+    return f'<a href="{html.escape(url, quote=True)}">{html.escape(text)}</a>'
+
+
+def price_line(it):
+    if it.get("old") and it["old"] > it["price"]:
+        pct = round((it["old"] - it["price"]) / it["old"] * 100)
+        return f"💰 <b>{fmt(it['price'])}</b> (بدل <s>{fmt(it['old'])}</s> — خصم {pct}%)"
+    return f"💰 السعر الحالي: <b>{fmt(it['price'])}</b>"
+
+
+def alternatives(query, res, n=2):
+    """اختيارات تانية غير أفضل نتيجة (من نفس المتجر)."""
+    top = res["top"]
+    out, seen = [], {norm(top["title"])[:40]}
+    for it in res["ordered"]:
+        if it is top or score(query, it["title"]) < 0.34:
+            continue
+        key = norm(it["title"])[:40]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+        if len(out) >= n:
+            break
+    return out
+
+
 def render(query, results):
+    """أمازون بس: أفضل نتيجة + اختيارين. لو متاجر تانية اتفعلت بنرجع لشكل المقارنة."""
+    if len(results) != 1:
+        return render_multi(query, results)
+    res = results[0]
+    top = res["top"]
+    e = html.escape
+    lines = [f"🔎 <b>{e(short(query, 60))}</b>", "", "🥇 <b>أفضل نتيجة</b>", e(short(top["title"], 90)), price_line(top)]
+    if top.get("rating"):
+        lines.append(f"⭐ تقييم {top['rating']:.1f}")
+    if not res["sure"]:
+        lines.append("⚠️ ممكن مش نفس المنتج بالظبط، راجع الاسم")
+    lines += ["", "🛒 " + link(top["url"], "اشتري من أمازون")]
+    alts = alternatives(query, res)
+    if alts:
+        lines += ["", "— — — — —", "📋 <b>اختيارات تانية:</b>"]
+        for i, it in enumerate(alts):
+            lines.append(f"{RANKS[i]} {link(it['url'], short(it['title'], 55))} — {fmt(it['price'])}")
+    lines += ["", "📢 المزيد من العروض يومياً: " + CHANNEL_URL]
+    return "\n".join(lines)
+
+
+def render_multi(query, results):
     e = html.escape
     lines = [f"🔎 <b>نتيجة البحث:</b> {e(short(query, 60))}", ""]
     for r in results:
@@ -425,15 +480,70 @@ def render_more(query, results):
     e = html.escape
     lines = [f"📋 <b>نتائج أكتر:</b> {e(short(query, 60))}", ""]
     for r in results:
-        st = r["store"]
-        lines.append(f"{st['emoji']} <b>{st['name']}</b>")
+        if len(results) > 1:
+            lines.append(f"{r['store']['emoji']} <b>{r['store']['name']}</b>")
         if not r["ordered"]:
             lines += ["— مفيش نتايج", ""]
             continue
-        for it in r["ordered"][:3]:
-            lines.append(f"• {e(short(it['title'], 60))}\n  {fmt(it['price'])} — {it['url']}")
+        for it in r["ordered"][:8]:
+            lines.append(f"• {link(it['url'], short(it['title'], 60))}\n  {fmt(it['price'])}")
         lines.append("")
     return "\n".join(lines)[:4000]
+
+
+# ---------------------------------------------------------------- votes (اقتراح المتاجر)
+VOTES_FILE = os.path.join(BASE, "store_votes.json")
+VOTE_STORES = ["نون", "جوميا", "كارفور", "بي تك", "رايه شوب"]
+
+
+def load_votes():
+    try:
+        with open(VOTES_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_vote(uid, name):
+    d = load_votes()
+    d[str(uid)] = name
+    try:
+        with open(VOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception as e:
+        note(f"save vote failed: {type(e).__name__}")
+
+
+def tally():
+    cnt = {}
+    for name in load_votes().values():
+        cnt[name] = cnt.get(name, 0) + 1
+    return sorted(cnt.items(), key=lambda kv: -kv[1])
+
+
+def ranking_text(limit=3):
+    rows = tally()[:limit]
+    if not rows:
+        return ""
+    return "\n".join(f"{i}) {html.escape(n)} — {c} صوت" for i, (n, c) in enumerate(rows, 1))
+
+
+def vote_kb():
+    rows, row = [], []
+    for i, n in enumerate(VOTE_STORES):
+        row.append(InlineKeyboardButton(n, callback_data=f"v:{i}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✍️ متجر تاني", callback_data="vc")])
+    return InlineKeyboardMarkup(rows)
+
+
+VOTE_TEXT = "🏪 <b>أنهي متجر تحب نضيفه للبحث؟</b>\nاختار متجر واحد (وتقدر تغيّر اختيارك في أي وقت)."
+VOTE_BTN = InlineKeyboardButton("🗳 صوّت على متجر جديد", callback_data="vote")
 
 
 # ---------------------------------------------------------------- limits / membership
@@ -472,68 +582,65 @@ async def is_member(bot, uid):
         return None
 
 
-JOIN_KB = InlineKeyboardMarkup([[InlineKeyboardButton("📢 اشترك في القناة", url=CHANNEL_URL)]])
+JOIN_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📢 اشترك في القناة", url=CHANNEL_URL)],
+    [InlineKeyboardButton("✅ اشتركت", callback_data="joined")],
+])
+NOT_MEMBER = "البوت ده لمشتركين قناة عروض وخصومات بس 🎁\nاشترك الأول وبعدين اضغط «✅ اشتركت»."
+NOT_FOUND = "ملقتش حاجة بالاسم ده 😕\nجرّب الماركة + الموديل بس، زي: سامسونج A15."
+SEARCH_FAIL = "حصلت مشكلة وأنا بدور، جرب تاني بعد شوية."
+STORES_TEXT = " و".join(x["name"] for x in ACTIVE)
 
 WELCOME = (
     "أهلاً بيك في <b>محرك بحث عروض وخصومات</b> 🔎\n\n"
-    "اكتب اسم أي منتج وأنا أدور عليه في أمازون ونون وجوميا وأقارنلك الأسعار.\n\n"
+    f"اكتب اسم أي منتج وأنا أجيبلك أحسن أسعاره على {STORES_TEXT} مصر، مع نسبة الخصم ولينك الشراء.\n\n"
     "مثال: <code>سماعة ريدمي بودز 5</code>\n\n"
-    "ℹ️ لينكات أمازون فيها كود الشراكة بتاع القناة، ومش بتزود عليك أي سعر."
+    "🏪 بنضيف متاجر جديدة للبحث، وإنت اللي تختار!\n"
+    "اضغط الزر تحت وصوّت على المتجر اللي عايزه."
 )
+WELCOME_KB = InlineKeyboardMarkup([[VOTE_BTN]])
 
 
-# ---------------------------------------------------------------- handlers
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ok = await is_member(context.bot, update.effective_user.id)
-    if ok:
-        await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text(
-            "البوت ده لمشتركين قناة عروض وخصومات بس 🎁\nاشترك في القناة وبعدين ابعت /start تاني.",
-            reply_markup=JOIN_KB,
-        )
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    uid = update.effective_user.id
-    query = re.sub(r"\s+", " ", (msg.text or "")).strip()
-    if len(query) < 2:
-        return
-    if len(query) > 100:
-        await msg.reply_text("اكتب اسم المنتج في سطر قصير (أقل من 100 حرف).")
-        return
-    ok = await is_member(context.bot, uid)
+# ---------------------------------------------------------------- search flow
+async def gate(bot, chat_id, uid, query, bot_data):
+    """بيتأكد من الاشتراك والحد اليومي. True لو يكمل البحث."""
+    ok = await is_member(bot, uid)
     if ok is None:
-        await msg.reply_text("حصلت مشكلة مؤقتة في التحقق من الاشتراك، جرب بعد شوية.")
-        return
+        await bot.send_message(chat_id, "حصلت مشكلة مؤقتة في التحقق من الاشتراك، جرب بعد شوية.")
+        return False
     if not ok:
-        await msg.reply_text(
-            "البوت ده لمشتركين قناة عروض وخصومات بس 🎁\nاشترك الأول وبعدين ابعت اسم المنتج.",
-            reply_markup=JOIN_KB,
-        )
-        return
+        bot_data.setdefault("pending", {})[uid] = query
+        await bot.send_message(chat_id, NOT_MEMBER, reply_markup=JOIN_KB)
+        return False
     if uid != OWNER_ID and used_today(uid).get(str(uid), 0) >= DAILY_LIMIT:
-        await msg.reply_text(f"وصلت للحد اليومي ({DAILY_LIMIT} عمليات بحث). كمّل بكرة 🌙")
-        return
-    status = await msg.reply_text("⏳ بدور لك في أمازون ونون وجوميا...")
+        await bot.send_message(chat_id, f"خلّصت عمليات البحث النهارده ({DAILY_LIMIT}). نكمّل بكرة 🌙")
+        return False
+    return True
+
+
+async def run_search(bot, chat_id, uid, query, bot_data):
+    status = await bot.send_message(chat_id, f"⏳ بدور لك على «{short(query, 40)}»...")
     try:
         results = await cached_search(query)
     except Exception as e:
         note(f"search crashed: {type(e).__name__} {str(e)[:150]}")
-        await status.edit_text("حصلت مشكلة وأنا بدور، جرب تاني بعد شوية.")
+        await status.edit_text(SEARCH_FAIL)
         return
     if uid != OWNER_ID:
         bump(uid)
     if not any(r["top"] for r in results):
-        await status.edit_text("ملقتش نتايج مطابقة 😕 جرب اسم أقصر أو بكلمات تانية (الماركة + الموديل).")
+        await status.edit_text(SEARCH_FAIL if all(r["error"] for r in results) else NOT_FOUND)
         return
     qid = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
-    store = context.bot_data.setdefault("res", {})
+    store = bot_data.setdefault("res", {})
     store[qid] = (query, results)
     while len(store) > 200:
         store.pop(next(iter(store)))
-    rows = [[InlineKeyboardButton("🔍 نتائج أكتر", callback_data=f"more:{qid}")]]
+    rows = []
+    first = next((r for r in results if r["top"]), None)
+    if first:
+        rows.append([InlineKeyboardButton(f"🛒 افتح في {first['store']['name']}", url=first["top"]["url"])])
+    rows.append([InlineKeyboardButton("🔍 نتائج أكتر", callback_data=f"more:{qid}"), VOTE_BTN])
     if uid == OWNER_ID and db.TOKEN:
         rows.append([InlineKeyboardButton("📢 ابعت للمسودة", callback_data=f"draft:{qid}")])
     kb = InlineKeyboardMarkup(rows)
@@ -541,16 +648,59 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     img = best_image(results)
     try:
         if img and len(text) <= 1000:
-            await msg.reply_photo(photo=img, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            await bot.send_photo(chat_id, photo=img, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
         else:
-            await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                                   disable_web_page_preview=True)
     except Exception as e:
         note(f"send result failed: {type(e).__name__} {str(e)[:120]}")
-        await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb,
+                               disable_web_page_preview=True)
     try:
         await status.delete()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------- handlers
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ok = await is_member(context.bot, update.effective_user.id)
+    if ok:
+        await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=WELCOME_KB)
+    else:
+        await update.message.reply_text(NOT_MEMBER, reply_markup=JOIN_KB)
+
+
+async def cmd_votes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    rows = tally()
+    if not rows:
+        await update.message.reply_text("لسه مفيش أصوات.")
+        return
+    total = sum(c for _, c in rows)
+    txt = f"🗳 <b>أصوات المتاجر ({total})</b>\n\n" + "\n".join(
+        f"{i}) {html.escape(n)} — {c}" for i, (n, c) in enumerate(rows, 1))
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    uid = update.effective_user.id
+    query = re.sub(r"\s+", " ", (msg.text or "")).strip()
+    if context.user_data.pop("await_store", False):
+        name = query[:40]
+        if len(name) >= 2:
+            save_vote(uid, name)
+            await msg.reply_text(f"✅ تمام، سجلت اقتراحك: «{name}». شكراً لمشاركتك!")
+        return
+    if len(query) < 2:
+        return
+    if len(query) > 100:
+        await msg.reply_text("اكتب اسم المنتج في سطر قصير (أقل من 100 حرف).")
+        return
+    if await gate(context.bot, msg.chat_id, uid, query, context.bot_data):
+        await run_search(context.bot, msg.chat_id, uid, query, context.bot_data)
 
 
 def make_draft(item):
@@ -563,16 +713,55 @@ def make_draft(item):
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    action, _, qid = (q.data or "").partition(":")
+    data = q.data or ""
+    action, _, arg = data.partition(":")
     uid = q.from_user.id
-    ent = (context.bot_data.get("res") or {}).get(qid)
+    chat_id = q.message.chat_id if q.message else uid
+
+    if action == "vote":
+        await q.answer()
+        await context.bot.send_message(chat_id, VOTE_TEXT, parse_mode=ParseMode.HTML, reply_markup=vote_kb())
+        return
+    if action == "v":
+        try:
+            name = VOTE_STORES[int(arg)]
+        except Exception:
+            await q.answer()
+            return
+        save_vote(uid, name)
+        await q.answer("✅ صوتك اتسجل")
+        txt = f"✅ صوتك اتسجل لـ «{html.escape(name)}»"
+        rk = ranking_text()
+        if rk:
+            txt += "\n\n🏆 <b>الأكتر طلباً دلوقتي:</b>\n" + rk
+        await context.bot.send_message(chat_id, txt, parse_mode=ParseMode.HTML)
+        return
+    if action == "vc":
+        context.user_data["await_store"] = True
+        await q.answer()
+        await context.bot.send_message(chat_id, "✍️ اكتب اسم المتجر اللي عايزه يتضاف (رسالة واحدة).")
+        return
+    if action == "joined":
+        ok = await is_member(context.bot, uid)
+        if not ok:
+            await q.answer("لسه مش لاقيك مشترك في القناة. اشترك الأول 🙂", show_alert=True)
+            return
+        await q.answer("✅ تمام")
+        pending = (context.bot_data.get("pending") or {}).pop(uid, None)
+        if pending and await gate(context.bot, chat_id, uid, pending, context.bot_data):
+            await run_search(context.bot, chat_id, uid, pending, context.bot_data)
+        else:
+            await context.bot.send_message(chat_id, "أهلاً بيك! اكتب اسم المنتج اللي بتدور عليه 🔎")
+        return
+
+    ent = (context.bot_data.get("res") or {}).get(arg)
     if not ent:
         await q.answer("البحث ده انتهى، ابعت اسم المنتج تاني.", show_alert=True)
         return
     query, results = ent
     if action == "more":
         await q.answer()
-        await context.bot.send_message(uid, render_more(query, results), parse_mode=ParseMode.HTML,
+        await context.bot.send_message(chat_id, render_more(query, results), parse_mode=ParseMode.HTML,
                                        disable_web_page_preview=True)
         return
     if action == "draft":
@@ -596,15 +785,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 m = await dbot.send_message(OWNER_ID, post, parse_mode=ParseMode.HTML,
                                             reply_markup=db.make_kb(pid), disable_web_page_preview=True)
             db.set_src(pid, [[OWNER_ID, m.message_id]])
-            await context.bot.send_message(uid, "✅ البوست اتبعت في شات بوت المسودات (Mix Draft Bot) بأزرار نشر وتعديل.")
+            await context.bot.send_message(chat_id, "✅ البوست اتبعت في شات بوت المسودات (Mix Draft Bot) بأزرار نشر وتعديل.")
         except Exception as e:
             note(f"draft failed: {type(e).__name__} {str(e)[:150]}")
             await context.bot.send_message(
-                uid, "معرفتش أبعت البوست. افتح بوت المسودات (Mix Draft Bot) وابعتله /start الأول وجرب تاني.")
+                chat_id, "معرفتش أبعت البوست. افتح بوت المسودات (Mix Draft Bot) وابعتله /start الأول وجرب تاني.")
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    log.warning("handler error: %s", type(context.error).__name__)
+    log.warning("handler error: %s %s", type(context.error).__name__, str(context.error)[:120])
 
 
 def main():
@@ -615,6 +804,7 @@ def main():
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("votes", cmd_votes))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
