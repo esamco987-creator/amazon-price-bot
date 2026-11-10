@@ -422,7 +422,7 @@ def render(query, results):
         lines.append(f"⭐ تقييم {top['rating']:.1f}")
     if not res["sure"]:
         lines.append("⚠️ ممكن مش نفس المنتج بالظبط، راجع الاسم")
-    lines += ["", "🛒 " + link(top["url"], "اشتري من أمازون")]
+    lines += ["", "🛒 اشتري من هنا:", html.escape(top["url"])]
     alts = alternatives(query, res)
     if alts:
         lines += ["", "— — — — —", "📋 <b>اختيارات تانية:</b>"]
@@ -618,6 +618,18 @@ async def gate(bot, chat_id, uid, query, bot_data):
     return True
 
 
+async def result_image(item):
+    """نفس صورة المسودة: كارت العرض لو فيه خصم، وإلا الصورة على خلفية بيضاء."""
+    def work():
+        raw = pb.download_image(item.get("image"))
+        return pb.product_image(item["title"], item["price"], item.get("old"), raw) if raw else None
+    try:
+        return await asyncio.to_thread(work)
+    except Exception as e:
+        note(f"result image failed: {type(e).__name__} {str(e)[:100]}")
+        return None
+
+
 async def run_search(bot, chat_id, uid, query, bot_data):
     status = await bot.send_message(chat_id, f"⏳ بدور لك على «{short(query, 40)}»...")
     try:
@@ -645,7 +657,11 @@ async def run_search(bot, chat_id, uid, query, bot_data):
         rows.append([InlineKeyboardButton("📢 ابعت للمسودة", callback_data=f"draft:{qid}")])
     kb = InlineKeyboardMarkup(rows)
     text = render(query, results)
-    img = best_image(results)
+    img = None
+    if first and first["sure"]:
+        img = await result_image(first["top"])
+    if not img:
+        img = best_image(results)
     try:
         if img and len(text) <= 1000:
             await bot.send_photo(chat_id, photo=img, caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
