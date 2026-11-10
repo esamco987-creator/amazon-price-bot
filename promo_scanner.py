@@ -11,6 +11,7 @@ import html
 import logging
 from urllib.parse import urlparse
 
+import requests
 from bs4 import BeautifulSoup
 
 import post_bot as pb
@@ -211,6 +212,28 @@ def build_post(item, promo, dates, link, plink):
     return "\n".join(lines)
 
 
+def send_debug_file(path):
+    """بيبعتلك نسخة من الصفحة على تيليجرام (مرة واحدة) عشان أقدر أحلل شكلها."""
+    flag = path + ".sent"
+    token = os.environ.get("DRAFT_BOT_TOKEN", "")
+    owner = os.environ.get("OWNER_ID", "")
+    if os.path.exists(flag) or not token or not owner:
+        return
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{token}/sendDocument",
+                data={"chat_id": owner, "caption": "نسخة من صفحة العرض للتشخيص"},
+                files={"document": ("promo_debug.html", f)},
+                timeout=120,
+            )
+        note(f"debug file sent: status {r.status_code}")
+        if r.status_code == 200:
+            open(flag, "w").write("1")
+    except Exception as e:
+        note(f"debug file send failed: {type(e).__name__}")
+
+
 def scan_once():
     """يرجع قايمة (item, post_html, image_bytes)."""
     sent = load_sent()
@@ -230,8 +253,10 @@ def scan_once():
             for ep in endpoints(body):
                 note("endpoint? " + ep)
             try:
-                with open(os.path.join(BASE, "promo_debug.html"), "w", encoding="utf-8") as f:
+                dbg = os.path.join(BASE, "promo_debug.html")
+                with open(dbg, "w", encoding="utf-8") as f:
                     f.write(body)
+                send_debug_file(dbg)
             except Exception:
                 pass
             continue
