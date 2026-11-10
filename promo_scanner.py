@@ -32,6 +32,7 @@ RESEND_AFTER = 3 * 86400   # نفس المنتج في نفس العرض ما ي�
 HOST = "www.amazon.eg"
 
 PROMO_PATTERNS = [
+    r"Buy\s+\d+,?\s*(?:Save|get)[^\n]{0,60}",
     r"احصل\s*على\s*\d+\s*بسعر\s*\d+",
     r"اشتر[يى]?\s*\d+\s*(?:و|واحصل|احصل)[^\n]{0,50}",
     r"وفر\s*\d+\s*%[^\n]{0,60}",
@@ -40,6 +41,7 @@ PROMO_PATTERNS = [
     r"Buy\s+\d+[^\n]{0,60}",
 ]
 DATE_RE = re.compile(r"من\s+(\d+\s+\S+)\s+\d{4}\s+حتى\s+(\d+\s+\S+)\s+\d{4}")
+DATE_EN_RE = re.compile(r"From\s+(\d+\s+\w+)\s+\d{4}\s+to\s+(\d+\s+\w+)\s+\d{4}", re.I)
 
 
 def note(msg):
@@ -178,7 +180,8 @@ def promo_info(body):
             if 3 < len(t) < 100:
                 title = t
     dates = None
-    m = DATE_RE.search(" ".join(lines[:200]))
+    joined = " ".join(lines[:200])
+    m = DATE_RE.search(joined) or DATE_EN_RE.search(joined)
     if m:
         dates = f"من {m.group(1)} لحد {m.group(2)}"
     return title, dates
@@ -212,6 +215,95 @@ def build_post(item, promo, dates, link, plink):
     return "\n".join(lines)
 
 
+def parse_money(d):
+    """يقرا سعر من كائن priceInfo.* (displayString)."""
+    if not isinstance(d, dict):
+        return None
+    return pb.parse_price(d.get("displayString") or "")
+
+
+def fix_url(u):
+    if not u:
+        return None
+    return "https:" + u if u.startswith("//") else u
+
+
+def load_promo(url):
+    """يفتح صفحة العرض ويجيب منتجاتها من نفس الطلب اللي الصفحة بتستخدمه.
+    يرجع dict: final, title, dates, products=[{asin,title,price,old,image}] أو None."""
+    import requests as rq
+
+    try:
+        final, _ = pb.resolve(url, pb.HEADER_STRATEGIES[0])
+    except Exception as e:
+        note(f"resolve failed: {type(e).__name__}")
+        return None
+    sess = rq.Session()
+    pid0 = promo_id(final)
+    if pid0:
+        final = f"https://{HOST}/-/ar/promotion/psp/{pid0}"  # النسخة العربية
+    hdr = dict(pb.HEADER_STRATEGIES[1])
+    hdr["Accept-Language"] = "ar-EG,ar;q=0.9,en;q=0.8"
+    try:
+        r = sess.get(final, headers=hdr, timeout=30)
+        body = r.text or ""
+    except Exception as e:
+        note(f"page get failed: {type(e).__name__}")
+        return None
+    host = urlparse(r.url).netloc or HOST
+    pid = promo_id(r.url) or promo_id(final)
+    m = re.search(r'"promotionId"\s*:\s*"([A-Z0-9]+)"', body)
+    pid = pid or (m.group(1) if m else None)
+    mm = re.search(r'"promotionMerchantId"\s*:\s*"([A-Z0-9]+)"', body)
+    ct = re.search(r"""anti-csrftoken-a2z["']\s*:\s*["']([^"']+)["']""", body)
+    title, dates = promo_info(body)
+    out = {"final": r.url, "title": title, "dates": dates, "products": [], "body": body}
+    if not pid or not ct:
+        note(f"api params missing: pid={bool(pid)} csrf={bool(ct)}")
+        return out
+    data = {
+        "promotionId": pid, "avgCustomerReview": "0", "priceTierMin": "", "priceTierMax": "",
+        "bestSeller": "0", "sortId": "[]", "applicabilityIndex": "", "productCategory": "",
+        "searchKeyword": "", "redirectAsin": "", "redirectMerchantId": "",
+        "productCategories": "[]", "subProductCategory": "", "selectedBrands": "[]",
+        "promotionMerchantId": mm.group(1) if mm else "", "isSNSOnly": "false", "isSUSOnly": "false",
+        "isCarouselPilot": "false", "isPrimeShippingEligible": "true", "isPreview": "false",
+        "isFirstPageLoadRequest": "true", "recordedGroupingIds": "[]",
+        "anti-csrftoken-a2z": ct.group(1),
+    }
+    h2 = {
+        "User-Agent": hdr.get("User-Agent", ""), "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": hdr["Accept-Language"], "X-Requested-With": "XMLHttpRequest",
+        "Referer": r.url, "Origin": f"https://{host}",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    }
+    try:
+        pr = sess.post(f"https://{host}/promotion/psp/productInfoList", data=data, headers=h2, timeout=40)
+        if pr.status_code != 200:
+            note(f"productInfoList status {pr.status_code}: {pr.text[:120]!r}")
+            return out
+        lst = ((pr.json().get("viewModels") or {}).get("PRODUCT_INFO_LIST")) or []
+    except Exception as e:
+        note(f"productInfoList failed: {type(e).__name__}")
+        return out
+    for p in lst:
+        try:
+            asin = p.get("asin")
+            if not asin:
+                continue
+            pi = p.get("priceInfo") or {}
+            price = parse_money(pi.get("priceToPay"))
+            old = parse_money(pi.get("basisPrice")) or parse_money(pi.get("strikeThroughPrice"))
+            out["products"].append({
+                "asin": asin, "title": p.get("title") or p.get("imgAlt"),
+                "price": price, "old": old, "image": fix_url(p.get("imgURL")),
+            })
+        except Exception:
+            continue
+    note(f"promo api: pid={pid} products={len(out['products'])}")
+    return out
+
+
 def send_debug_file(path):
     """بيبعتلك نسخة من الصفحة على تيليجرام (مرة واحدة) عشان أقدر أحلل شكلها."""
     flag = path + ".sent"
@@ -242,38 +334,31 @@ def scan_once():
     for url in page_urls():
         if len(results) >= MAX_PER_ROUND:
             break
-        final, body = fetch(url)
-        if not body:
+        info = load_promo(url)
+        if not info:
             stats.append(f"{url[:40]}: مفتحتش")
             continue
-        asins = extract_asins(body)
-        promo, dates = promo_info(body)
-        if not asins or not promo:
-            stats.append(f"{url[:40]}: asins={len(asins)} promo={'yes' if promo else 'no'} {diagnose(body)}")
-            for ep in endpoints(body):
-                note("endpoint? " + ep)
-            try:
-                dbg = os.path.join(BASE, "promo_debug.html")
-                with open(dbg, "w", encoding="utf-8") as f:
-                    f.write(body)
-                send_debug_file(dbg)
-            except Exception:
-                pass
+        promo, dates, prods = info["title"], info["dates"], info["products"]
+        if not prods or not promo:
+            stats.append(f"{url[:40]}: products={len(prods)} promo={'yes' if promo else 'no'}")
             continue
-        pkey = promo_id(final) or promo
-        plink = promo_link(final, url)
+        pkey = promo_id(info["final"]) or promo
+        plink = promo_link(info["final"], url)
         made = 0
-        for asin in asins[:MAX_FETCH]:
+        for p in prods[:MAX_FETCH]:
             if made >= MAX_PER_PAGE or len(results) >= MAX_PER_ROUND:
                 break
+            asin = p["asin"]
             dkey = f"{asin}|{pkey}"
             if time.time() - sent.get(dkey, 0) < RESEND_AFTER:
                 continue
-            dbg = []
-            _, page = pb.get_page(f"https://{HOST}/dp/{asin}", dbg)
-            if not page:
-                continue
-            title, price, old, _, img = pb.read_product(page)
+            title, price, old, img = p["title"], p["price"], p["old"], p["image"]
+            if not title or not price:
+                _, page = pb.get_page(f"https://{HOST}/dp/{asin}", [])
+                if not page:
+                    continue
+                t2, p2, o2, _, i2 = pb.read_product(page)
+                title, price, old, img = title or t2, price or p2, old or o2, img or i2
             if not title or not price:
                 continue
             item = {"asin": asin, "title": title, "price": price, "old": old,
@@ -284,12 +369,11 @@ def scan_once():
             image = deal_card.make_card(item, raw) if raw else None
             if not image and raw:
                 image = pb.prepare_image(raw)
-            link = pb.affiliate(HOST, asin)
-            results.append((item, build_post(item, promo, dates, link, plink), image))
+            results.append((item, build_post(item, promo, dates, pb.affiliate(HOST, asin), plink), image))
             sent[dkey] = time.time()
             made += 1
-            time.sleep(3)
-        stats.append(f"{promo[:30]}: asins={len(asins)} new={made}")
+            time.sleep(2)
+        stats.append(f"{promo[:30]}: products={len(prods)} new={made}")
     save_sent(sent)
     msg = f"promo scan: pages={len(page_urls())} new={len(results)} | " + " || ".join(stats)
     log.info(msg)
