@@ -31,7 +31,9 @@ MY_TAG = "mixdeals-21"
 FOOTER = (
     "📢 قناة عروض وخصومات\n"
     "للمزيد من العروض يوميًا:\n"
-    "https://t.me/PromoCodeOnlain"
+    "https://t.me/PromoCodeOnlain\n\n"
+    "🔎 دوّر على أي منتج وشوف أحسن سعر:\n"
+    "https://t.me/Mix_Compare_bot"
 )
 
 HEADERS = {
