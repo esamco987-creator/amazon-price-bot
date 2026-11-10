@@ -187,10 +187,12 @@ def make_card(item, raw_image):
         by = ly + 150  # خط الأساس
         pf = font(96)
         sf = font(40)
-        pct_txt = f"-{item['pct']}%"
-        pctf = font(56)
-        d.text((rx, by), pct_txt, font=pctf, fill=CRIMSON, anchor="rs")
-        x = rx - d.textlength(pct_txt, font=pctf) - 28
+        x = rx
+        if item.get("pct"):
+            pct_txt = f"-{item['pct']}%"
+            pctf = font(56)
+            d.text((rx, by), pct_txt, font=pctf, fill=CRIMSON, anchor="rs")
+            x = rx - d.textlength(pct_txt, font=pctf) - 28
 
         price = round(item["price"], 2)
         whole = int(price)
@@ -204,20 +206,21 @@ def make_card(item, raw_image):
         x -= d.textlength(wt, font=pf) + 14
         draw_text(d, (x, by - 8), "جنيه", font(34), INK, "rs")
 
-        # سعر القائمة
-        gy = by + 62
-        of = font(34)
-        lab = "سعر القائمة:"
-        draw_text(d, (rx, gy), lab, of, MUTED, "rs")
-        x = rx - width(d, lab, of) - 12
-        old_txt = f"{money(item['old'])} جنيه"
-        ow = width(d, old_txt, of)
-        draw_text(d, (x, gy), old_txt, of, MUTED, "rs")
-        d.line([x - ow, gy - 12, x, gy - 12], fill=MUTED, width=3)
+        if item.get("old") and item["old"] > item["price"]:
+            # سعر القائمة
+            gy = by + 62
+            of = font(34)
+            lab = "سعر القائمة:"
+            draw_text(d, (rx, gy), lab, of, MUTED, "rs")
+            x = rx - width(d, lab, of) - 12
+            old_txt = f"{money(item['old'])} جنيه"
+            ow = width(d, old_txt, of)
+            draw_text(d, (x, gy), old_txt, of, MUTED, "rs")
+            d.line([x - ow, gy - 12, x, gy - 12], fill=MUTED, width=3)
 
-        # التوفير
-        save = item["old"] - item["price"]
-        draw_text(d, (rx, gy + 56), f"وفّر {money(save)} جنيه", font(38), GREEN, "rs")
+            # التوفير
+            save = item["old"] - item["price"]
+            draw_text(d, (rx, gy + 56), f"وفّر {money(save)} جنيه", font(38), GREEN, "rs")
 
         # شريط القناة تحت
         d.rectangle([0, H - 100, W, H], fill=NAVY)
