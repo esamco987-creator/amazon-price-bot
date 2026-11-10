@@ -26,6 +26,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 import deals_scanner as ds
 import post_bot as pb
+import deal_card
 import draft_bot as db
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -700,6 +701,47 @@ async def cmd_votes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 
+ANNOUNCE_TEXT = (
+    "🔎 <b>جديد في القناة: محرك بحث عروض وخصومات!</b>\n\n"
+    "اكتب اسم أي منتج وشوف أحسن سعر وخصم عليه في أمازون مصر في ثواني، ومعاه لينك الشراء 🛒\n\n"
+    "✅ مجاني لمشتركي القناة\n"
+    "✅ نتيجة فورية مع نسبة الخصم\n"
+    "✅ بنضيف متاجر جديدة، وإنت اللي تختار بالتصويت 🗳\n\n"
+    "ابدأ من هنا 👇\n"
+    "https://t.me/Mix_Compare_bot"
+)
+
+
+async def send_to_drafts(image, post):
+    """يبعت صورة + نص لشات بوت المسودات (بأزرار نشر وتعديل)."""
+    pid = db.new_pid()
+    db.store_draft(pid, image, post)
+    dbot = Bot(db.TOKEN)
+    if image and len(post) <= 1000:
+        m = await dbot.send_photo(OWNER_ID, photo=image, caption=post, parse_mode=ParseMode.HTML,
+                                  reply_markup=db.make_kb(pid))
+    else:
+        m = await dbot.send_message(OWNER_ID, post, parse_mode=ParseMode.HTML,
+                                    reply_markup=db.make_kb(pid), disable_web_page_preview=True)
+    db.set_src(pid, [[OWNER_ID, m.message_id]])
+
+
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لصاحب القناة: يجهّز بوست إعلان البوت في شات المسودات."""
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not db.TOKEN:
+        await update.message.reply_text("محتاج DRAFT_BOT_TOKEN في البيئة عشان أبعت للمسودات.")
+        return
+    try:
+        image = await asyncio.to_thread(deal_card.make_announce_card)
+        await send_to_drafts(image, ANNOUNCE_TEXT)
+        await update.message.reply_text("✅ بوست الإعلان اتبعت في شات المسودات. اضغط نشر وبعدها ثبّته في القناة.")
+    except Exception as e:
+        note(f"announce failed: {type(e).__name__} {str(e)[:150]}")
+        await update.message.reply_text("معرفتش أبعت البوست. افتح بوت المسودات وابعتله /start وجرب تاني.")
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     uid = update.effective_user.id
@@ -821,6 +863,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("votes", cmd_votes))
+    app.add_handler(CommandHandler("announce", cmd_announce))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
