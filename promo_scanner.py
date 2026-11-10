@@ -101,7 +101,7 @@ def fetch(url):
 
 ASIN_PATTERNS = [
     # data-asin="B0.." أو data-asin=\"B0..\" أو "asin":"B0.." (حتى لو الاقتباس متهرّب بـ \)
-    r'asin[\W_]{1,8}([A-Z0-9]{10})(?![A-Za-z0-9])',
+    r'asins?[\W_]{1,8}([A-Z0-9]{10})(?![A-Za-z0-9])',
     r'amzn1\.asin\.([A-Z0-9]{10})',
     r'/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})',
 ]
@@ -121,7 +121,23 @@ def extract_asins(body):
     for _, a in hits:
         if a not in found:
             found.append(a)
+    # كمان أي كود شكله زي ASIN (B0 + 8 حروف/أرقام) في الصفحة (للقوايم المكتوبة كمصفوفة)
+    for m in re.finditer(r"(?<![A-Za-z0-9])(B0[A-Z0-9]{8})(?![A-Za-z0-9])", body):
+        if m.group(1) not in found:
+            found.append(m.group(1))
     return found
+
+
+def endpoints(body, limit=14):
+    """روابط/مسارات في كود الصفحة ممكن تكون هي اللي بتحمّل المنتجات (للتشخيص)."""
+    out = []
+    for m in re.finditer(r"""["'](/[A-Za-z0-9_\-./]*(?:ajax|promotion|api|asin|products|search|widget)[A-Za-z0-9_\-./?=&%:{}$]*)["']""", body, flags=re.I):
+        v = m.group(1)
+        if v not in out and len(v) < 140:
+            out.append(v)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def diagnose(body):
@@ -211,6 +227,8 @@ def scan_once():
         promo, dates = promo_info(body)
         if not asins or not promo:
             stats.append(f"{url[:40]}: asins={len(asins)} promo={'yes' if promo else 'no'} {diagnose(body)}")
+            for ep in endpoints(body):
+                note("endpoint? " + ep)
             try:
                 with open(os.path.join(BASE, "promo_debug.html"), "w", encoding="utf-8") as f:
                     f.write(body)
