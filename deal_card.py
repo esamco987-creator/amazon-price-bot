@@ -246,3 +246,83 @@ def make_card(item, raw_image):
     except Exception as e:
         log.warning("card failed: %s %s", type(e).__name__, e)
         return None
+
+
+def _footer(card, d):
+    d.rectangle([0, H - 100, W, H], fill=NAVY)
+    right = W - 40
+    if os.path.exists(LOGO_FILE):
+        try:
+            lg = Image.open(LOGO_FILE).convert("RGBA")
+            lg.thumbnail((74, 74), Image.LANCZOS)
+            d.ellipse([right - 80, H - 90, right, H - 10], fill=WHITE)
+            card.paste(lg, (right - 80 + (80 - lg.width) // 2, H - 90 + (80 - lg.height) // 2), lg)
+            right -= 98
+        except Exception:
+            pass
+    bf = font(42)
+    bw = int(width(d, BRAND, bf)) + 56
+    d.rounded_rectangle([right - bw, H - 84, right, H - 16], radius=18, fill=YELLOW)
+    draw_text(d, (right - bw // 2, H - 50), BRAND, bf, NAVY, "mm")
+    d.text((40, H - 50), LINK, font=font(34), fill=WHITE, anchor="lm")
+
+
+def make_promo_card(title, images, dates=None):
+    """كارت لعرض كمية (اشتري 3 بسعر 2 ...): عنوان العرض + كولاج صور من منتجاته.
+    images: قايمة بايتات صور. يرجع JPEG بايتات أو None."""
+    try:
+        if not ensure_font() or not images:
+            return None
+        card = Image.new("RGB", (W, H), WHITE)
+        d = ImageDraw.Draw(card)
+        d.rectangle([0, 0, W, 16], fill=NAVY)
+        d.rectangle([0, 16, W, 22], fill=YELLOW)
+
+        # كولاج الصور على اليمين
+        imgs = []
+        for raw in images[:4]:
+            try:
+                im = Image.open(io.BytesIO(raw)).convert("RGBA")
+                bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                imgs.append(Image.alpha_composite(bg, im).convert("RGB"))
+            except Exception:
+                continue
+        if not imgs:
+            return None
+        gx0, gy0, gw, gh = W - 40 - 560, 50, 560, 610
+        if len(imgs) == 1:
+            cells = [(gx0, gy0, gw, gh)]
+        elif len(imgs) == 2:
+            cells = [(gx0, gy0, gw, gh // 2 - 6), (gx0, gy0 + gh // 2 + 6, gw, gh // 2 - 6)]
+        else:
+            cw, ch = gw // 2 - 6, gh // 2 - 6
+            cells = [(gx0, gy0, cw, ch), (gx0 + cw + 12, gy0, cw, ch),
+                     (gx0, gy0 + ch + 12, cw, ch), (gx0 + cw + 12, gy0 + ch + 12, cw, ch)]
+        for im, (x, y, cw, ch) in zip(imgs, cells):
+            d.rounded_rectangle([x, y, x + cw, y + ch], radius=14, outline=(225, 225, 232), width=3)
+            im.thumbnail((cw - 16, ch - 16), Image.LANCZOS)
+            card.paste(im, (x + (cw - im.width) // 2, y + (ch - im.height) // 2))
+
+        # عنوان العرض على الشمال
+        rx = 575
+        lt = "عرض خاص"
+        lf = font(34)
+        lw = int(width(d, lt, lf)) + 44
+        d.rounded_rectangle([rx - lw, 70, rx, 122], radius=8, fill=CRIMSON)
+        draw_text(d, (rx - lw // 2, 96), lt, lf, WHITE, "mm")
+        tf = font(56)
+        y = 170
+        for ln in wrap(d, title, tf, 530, 4):
+            draw_text(d, (rx, y), ln, tf, INK, "ra")
+            y += 76
+        if dates:
+            draw_text(d, (rx, y + 20), dates, font(38), MUTED, "ra")
+        draw_text(d, (rx, H - 150), "الخصم بيظهر في عربة التسوق", font(34), MUTED, "rs")
+
+        _footer(card, d)
+        out = io.BytesIO()
+        card.save(out, "JPEG", quality=92)
+        return out.getvalue()
+    except Exception as e:
+        log.warning("promo card failed: %s %s", type(e).__name__, e)
+        return None
