@@ -99,13 +99,39 @@ def fetch(url):
     return best
 
 
+ASIN_PATTERNS = [
+    r'data-asin=["\']([A-Z0-9]{10})["\']',
+    r'amzn1\.asin\.([A-Z0-9]{10})',
+    r'/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})',
+    r'["\']asin["\']\s*[:=]\s*["\']([A-Z0-9]{10})["\']',
+    r'\basin=([A-Z0-9]{10})',
+]
+
+
 def extract_asins(body):
+    """كل أكواد المنتجات (ASIN) في الصفحة بترتيب ظهورها."""
+    hits = []
+    for p in ASIN_PATTERNS:
+        for m in re.finditer(p, body, flags=re.I):
+            a = m.group(1).upper()
+            if re.fullmatch(r"[A-Z0-9]{10}", a) and re.search(r"\d", a):
+                hits.append((m.start(), a))
+    hits.sort()
     found = []
-    for m in re.finditer(r'data-asin="([A-Z0-9]{10})"|/(?:dp|gp/product)/([A-Z0-9]{10})', body):
-        a = m.group(1) or m.group(2)
-        if a and a not in found:
+    for _, a in hits:
+        if a not in found:
             found.append(a)
     return found
+
+
+def diagnose(body):
+    """معلومات تساعدنا نفهم شكل الصفحة لو مفيش منتجات."""
+    low = body.lower()
+    return (
+        f"len={len(body)} data-asin={low.count('data-asin')} dp={low.count('/dp/')} "
+        f"asin={low.count('asin')} captcha={'captcha' in low} "
+        f"robot={'robot' in low} json={low.count('application/json')} next={'__next' in low}"
+    )
 
 
 def promo_info(body):
@@ -183,7 +209,12 @@ def scan_once():
         asins = extract_asins(body)
         promo, dates = promo_info(body)
         if not asins or not promo:
-            stats.append(f"{url[:40]}: asins={len(asins)} promo={'نعم' if promo else 'لا'}")
+            stats.append(f"{url[:40]}: asins={len(asins)} promo={'yes' if promo else 'no'} {diagnose(body)}")
+            try:
+                with open(os.path.join(BASE, "promo_debug.html"), "w", encoding="utf-8") as f:
+                    f.write(body)
+            except Exception:
+                pass
             continue
         pkey = promo_id(final) or promo
         plink = promo_link(final, url)
