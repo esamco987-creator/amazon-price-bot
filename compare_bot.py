@@ -17,6 +17,7 @@ import random
 import string
 import asyncio
 import logging
+import datetime
 from urllib.parse import quote
 
 import requests
@@ -547,6 +548,174 @@ VOTE_TEXT = "🏪 <b>أنهي متجر تحب نضيفه للبحث؟</b>\nاخ�
 VOTE_BTN = InlineKeyboardButton("🗳 صوّت على متجر جديد", callback_data="vote")
 
 
+# ---------------------------------------------------------------- statistics (إحصائيات للمالك)
+STATS_FILE = os.path.join(BASE, "search_stats.json")
+REPORT_HOUR = 22   # التقرير اليومي الساعة كام (بتوقيت مصر)
+
+
+def load_stats():
+    try:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            d = {}
+    except Exception:
+        d = {}
+    for k in ("users", "daily", "queries", "blocked"):
+        d.setdefault(k, {})
+    d.setdefault("converted", [])
+    return d
+
+
+def save_stats(d):
+    try:
+        tmp = STATS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, STATS_FILE)
+    except Exception as e:
+        note(f"save stats failed: {type(e).__name__}")
+
+
+def touch(user):
+    """يسجل إن الشخص استخدم البوت النهارده (ويعرف لو جديد)."""
+    try:
+        if not user or user.id == OWNER_ID:
+            return
+        d = load_stats()
+        uid, t = str(user.id), _today()
+        u = d["users"].get(uid)
+        if u is None:
+            u = {"first": t, "searches": 0}
+            d["users"][uid] = u
+        u["name"] = (user.full_name or "")[:40]
+        u["username"] = user.username or ""
+        u["last"] = t
+        day = d["daily"].setdefault(t, {"searches": 0, "active": []})
+        if uid not in day["active"]:
+            day["active"].append(uid)
+        if len(d["daily"]) > 60:
+            for old in sorted(d["daily"])[:-60]:
+                d["daily"].pop(old, None)
+        save_stats(d)
+    except Exception as e:
+        note(f"touch failed: {type(e).__name__}")
+
+
+def record_blocked(uid):
+    try:
+        if uid == OWNER_ID:
+            return
+        d = load_stats()
+        k = str(uid)
+        if k not in d["blocked"] and k not in d["converted"]:
+            d["blocked"][k] = _today()
+            save_stats(d)
+    except Exception as e:
+        note(f"record_blocked failed: {type(e).__name__}")
+
+
+def record_search(uid, query):
+    try:
+        if uid == OWNER_ID:
+            return
+        d = load_stats()
+        k, t = str(uid), _today()
+        u = d["users"].setdefault(k, {"first": t, "searches": 0})
+        u["searches"] = u.get("searches", 0) + 1
+        u["last"] = t
+        day = d["daily"].setdefault(t, {"searches": 0, "active": []})
+        day["searches"] = day.get("searches", 0) + 1
+        if k not in day["active"]:
+            day["active"].append(k)
+        key = " ".join(tokens(query))[:60]
+        if key:
+            q = d["queries"].setdefault(key, {"q": query[:60], "n": 0})
+            q["n"] += 1
+            if len(d["queries"]) > 400:
+                for kk, _ in sorted(d["queries"].items(), key=lambda kv: kv[1]["n"])[:100]:
+                    d["queries"].pop(kk, None)
+        if k in d["blocked"]:
+            d["blocked"].pop(k, None)
+            if k not in d["converted"]:
+                d["converted"].append(k)
+        save_stats(d)
+    except Exception as e:
+        note(f"record_search failed: {type(e).__name__}")
+
+
+def disp(u):
+    if u.get("username"):
+        return "@" + u["username"]
+    return u.get("name") or "مستخدم"
+
+
+def _short_date(s):
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%d").strftime("%d/%m")
+    except Exception:
+        return s or "—"
+
+
+def stats_text():
+    d = load_stats()
+    e = html.escape
+    t = _today()
+    users = d["users"]
+    day = d["daily"].get(t, {"searches": 0, "active": []})
+    active = [u for u in day.get("active", []) if u in users]
+    new_today = [u for u in active if users[u].get("first") == t]
+    old_today = len(active) - len(new_today)
+    week = 0
+    for i in range(7):
+        dd = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
+        week += d["daily"].get(dd, {}).get("searches", 0)
+    total_searches = sum(u.get("searches", 0) for u in users.values())
+    searchers = sum(1 for u in users.values() if u.get("searches", 0) > 0)
+    lines = [
+        "📊 <b>إحصائيات محرك البحث</b>", "",
+        f"👥 إجمالي المستخدمين: <b>{len(users):,}</b> (بحثوا فعلاً: {searchers:,})",
+        f"🆕 جدد النهارده: <b>{len([1 for u in users.values() if u.get('first') == t])}</b>",
+        f"🔁 نشطين النهارده: <b>{len(active)}</b> (جدد {len(new_today)} • قدامى {old_today})", "",
+        "🔎 <b>عمليات البحث:</b>",
+        f"النهارده {day.get('searches', 0):,} • آخر 7 أيام {week:,} • الكل {total_searches:,}",
+    ]
+    tq = sorted(d["queries"].values(), key=lambda x: -x["n"])[:5]
+    if tq:
+        lines += ["", "🔥 <b>أكتر بحث:</b>"] + [f"{i}) {e(x['q'])} ({x['n']})" for i, x in enumerate(tq, 1)]
+    tu = sorted([u for u in users.values() if u.get("searches", 0) > 0], key=lambda x: -x["searches"])[:5]
+    if tu:
+        lines += ["", "🏆 <b>أنشط المستخدمين:</b>", " • ".join(f"{e(disp(u))} ({u['searches']})" for u in tu)]
+    pending, conv = len(d["blocked"]), len(d["converted"])
+    if pending or conv:
+        lines += ["", f"🚪 حاولوا يبحثوا وهم مش مشتركين: <b>{pending + conv}</b>",
+                  f"✅ اشتركوا وبحثوا بعدها: <b>{conv}</b> • لسه مشتركوش: {pending}"]
+    vt = tally()[:1]
+    if vt:
+        lines.append(f"🗳 أعلى متجر مطلوب: {e(vt[0][0])} ({vt[0][1]} صوت)")
+    return "\n".join(lines)
+
+
+def users_text(n=20):
+    users = load_stats()["users"]
+    if not users:
+        return "لسه مفيش مستخدمين."
+    rows = sorted(users.values(), key=lambda u: u.get("last", ""), reverse=True)[:n]
+    lines = [f"👥 <b>آخر {len(rows)} مستخدم</b>", ""]
+    for u in rows:
+        lines.append(f"• {html.escape(disp(u))} — أول مرة {_short_date(u.get('first'))} • "
+                     f"آخر مرة {_short_date(u.get('last'))} • {u.get('searches', 0)} بحث")
+    return "\n".join(lines)[:4000]
+
+
+def report_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo("Africa/Cairo")
+    except Exception:
+        return datetime.timezone(datetime.timedelta(hours=2))
+
+
 # ---------------------------------------------------------------- limits / membership
 def _today():
     return time.strftime("%Y-%m-%d")
@@ -611,6 +780,7 @@ async def gate(bot, chat_id, uid, query, bot_data):
         return False
     if not ok:
         bot_data.setdefault("pending", {})[uid] = query
+        record_blocked(uid)
         await bot.send_message(chat_id, NOT_MEMBER, reply_markup=JOIN_KB)
         return False
     if uid != OWNER_ID and used_today(uid).get(str(uid), 0) >= DAILY_LIMIT:
@@ -641,6 +811,7 @@ async def run_search(bot, chat_id, uid, query, bot_data):
         return
     if uid != OWNER_ID:
         bump(uid)
+        record_search(uid, query)
     if not any(r["top"] for r in results):
         await status.edit_text(SEARCH_FAIL if all(r["error"] for r in results) else NOT_FOUND)
         return
@@ -681,6 +852,7 @@ async def run_search(bot, chat_id, uid, query, bot_data):
 
 # ---------------------------------------------------------------- handlers
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch(update.effective_user)
     ok = await is_member(context.bot, update.effective_user.id)
     if ok:
         await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=WELCOME_KB)
@@ -742,10 +914,30 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("معرفتش أبعت البوست. افتح بوت المسودات وابعتله /start وجرب تاني.")
 
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text(stats_text(), parse_mode=ParseMode.HTML)
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    await update.message.reply_text(users_text(), parse_mode=ParseMode.HTML)
+
+
+async def daily_report(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await context.bot.send_message(OWNER_ID, "🌙 <b>تقرير اليوم</b>\n\n" + stats_text(), parse_mode=ParseMode.HTML)
+    except Exception as e:
+        note(f"daily report failed: {type(e).__name__} {str(e)[:100]}")
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     uid = update.effective_user.id
     query = re.sub(r"\s+", " ", (msg.text or "")).strip()
+    touch(update.effective_user)
     if context.user_data.pop("await_store", False):
         name = query[:40]
         if len(name) >= 2:
@@ -774,6 +966,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     action, _, arg = data.partition(":")
     uid = q.from_user.id
+    touch(q.from_user)
     chat_id = q.message.chat_id if q.message else uid
 
     if action == "vote":
@@ -864,9 +1057,15 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("votes", cmd_votes))
     app.add_handler(CommandHandler("announce", cmd_announce))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
+    if app.job_queue:
+        app.job_queue.run_daily(daily_report, time=datetime.time(REPORT_HOUR, 0, tzinfo=report_tz()), name="daily_report")
+    else:
+        log.warning("job_queue مش متاح: التقرير اليومي موقوف (استخدم /stats)")
     log.info("compare bot running")
     app.run_polling()
 
