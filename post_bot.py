@@ -39,7 +39,7 @@ MY_TAG = "mixdeals-21"
 CHANNEL_LINK = "https://t.me/PromoCodeOnlain"
 SEARCH_BOT_LINK = "https://t.me/Mix_Compare_bot"
 BOT_LINE = []  # (قديم) السطر بقى جوه FOOTER_LINES
-FOOTER_LINES = ["📢 للمزيد من العروض: t.me/PromoCodeOnlain", "🔎 دوّر على أي منتج: t.me/Mix_Compare_bot"]
+FOOTER_LINES = ["📢 قناتنا: @PromoCodeOnlain", "🔎 ابحث عن أي منتج: @Mix_Compare_bot"]
 BASE = os.path.dirname(os.path.abspath(__file__))
 USERS_FILE = os.path.join(BASE, "allowed_users.json")
 LOGO_FILE = os.path.join(BASE, "logo.png")
@@ -418,8 +418,8 @@ def prepare_image(data):
 COMPACT_POST = False
 
 
-def product_card(title, price, old, raw):
-    """كارت العرض لو فيه خصم، وإلا None."""
+def product_card(title, price, old, raw, extra=None):
+    """كارت العرض لو فيه خصم، وإلا None. extra: rating / reviews / coupon (اختياري)."""
     if not raw or not (price and old and old > price):
         return None
     try:
@@ -427,17 +427,19 @@ def product_card(title, price, old, raw):
         if pct < 1:
             return None
         import deal_card
-        return deal_card.make_card({"title": title, "price": price, "old": old, "pct": pct}, raw)
+        item = {"title": title, "price": price, "old": old, "pct": pct}
+        item.update({k: v for k, v in (extra or {}).items() if v})
+        return deal_card.make_card(item, raw)
     except Exception as e:
         log.warning("card failed: %s", type(e).__name__)
         return None
 
 
-def product_image(title, price, old, raw):
+def product_image(title, price, old, raw, extra=None):
     """كارت العرض (لو فيه خصم) وإلا الصورة العادية على خلفية بيضاء."""
     if not raw:
         return None
-    return product_card(title, price, old, raw) or prepare_image(raw)
+    return product_card(title, price, old, raw, extra) or prepare_image(raw)
 
 
 def short_title(t, limit=95):
@@ -535,7 +537,12 @@ def process_link(url):
 
     link = affiliate(host, asin)
     raw = download_image(img)
-    card = product_card(title, price, old, raw)
+    try:
+        import deals_scanner
+        coupon = deals_scanner.extract_coupon(page, asin)
+    except Exception:
+        coupon = None
+    card = product_card(title, price, old, raw, {"rating": rating, "coupon": coupon})
     image = card or (prepare_image(raw) if raw else None)
     post = build_post(title, price, old, rating, link, compact=COMPACT_POST and bool(card))
     return True, {"image": image, "post": post, "price": price}
