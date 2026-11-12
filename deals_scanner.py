@@ -37,12 +37,12 @@ TOKEN_URLS = {
 
 # True = بوست مختصر تحت الكارت. False = البوست الكامل زي الأول.
 COMPACT_POST = False
-MIN_DISCOUNT = 35          # أقل نسبة خصم (عروض أقل من كده مش بتتبعت)
-MAX_DISCOUNT = 85          # أكتر من كده غالباً سعر قايمة مزيف
-HOT_DISCOUNT = 50          # من النسبة دي العرض بيتعلّم "ممتاز"
-MIN_PRICE = 40             # أقل سعر للمنتج (نشيل المنتجات الرخيصة اللي مالهاش لازمة)
-MIN_RATING = 3.8           # أقل تقييم (لو المنتج عليه تقييم)
-MIN_REVIEWS = 3            # أقل عدد تقييمات (لو العدد معروف)
+MIN_DISCOUNT = 40          # أقل نسبة خصم (عروض أقل من كده مش بتتبعت)
+MAX_DISCOUNT = 80          # أكتر من كده غالباً سعر قايمة مزيف
+HOT_DISCOUNT = 55          # من النسبة دي العرض بيتعلّم "ممتاز"
+MIN_PRICE = 120            # أقل سعر للمنتج (نشيل المنتجات الرخيصة اللي مالهاش لازمة)
+MIN_RATING = 4.0           # أقل تقييم (لو المنتج عليه تقييم)
+MIN_REVIEWS = 15           # أقل عدد تقييمات (لو العدد معروف)
 SCAN_EVERY = 5 * 60        # كل قد إيه يعيد الفحص (ثواني)
 KEYWORDS_PER_ROUND = 6     # عدد كلمات البحث في الدفعة
 MAX_BATCHES = 2            # أقصى عدد دفعات في الجولة (يعني 12 طلب بحث على الأكتر)
@@ -51,6 +51,14 @@ HOURLY_CAP = 12            # أقصى عدد عروض في الساعة
 DAILY_CAP = 150            # أقصى عدد عروض في اليوم
 DAILY_REQUESTS = 6000      # أقصى طلبات API في اليوم (حد أمازون 8640)
 RATE_PAUSE = 10 * 60       # لو أمازون قالت "بطّأ" (429)، نوقف الفحص المدة دي
+MIN_SCORE = 95             # أقل "درجة" للعرض عشان يتبعت (الأضعف مش بيتبعت حتى لو عدّى الفلاتر)
+NO_DATA_MIN_PCT = 50       # لو التقييم مش معروف: لازم خصم أكبر
+NO_DATA_MIN_PRICE = 200    # ... وسعر أعلى
+JUNK_WORDS = (             # منتجات هامشية (إكسسوارات رخيصة / حافظات / لزق...)
+    "جراب", "كفر", "حافظة", "حافظه", "واقي شاشة", "لاصق شاشة", "سكرين", "ملصق", "استيكر", "ستيكر",
+    "حلق", "خاتم", "اسورة", "إسورة", "سلسلة", "دبوس", "شريط لاصق", "bracelet", "sticker", "screen protector",
+    "case for", "phone case", "cover for", "keychain", "ميدالية", "عينة", "sample", "تجريبي",
+)
 RESEND_AFTER = 48 * 3600   # نفس المنتج ما يتبعتش تاني قبل المدة دي (إلا لو السعر نزل أكتر)
 
 # كلمات البحث. عدّل فيها زي ما تحب.
@@ -304,15 +312,26 @@ def is_new(sent, item):
 
 
 # ---------------------------------------------------------------- quality
+def is_junk(it):
+    t = (it.get("title") or "").lower()
+    return any(w.lower() in t for w in JUNK_WORDS)
+
+
 def is_good(it):
-    """عرض يستاهل: خصم حقيقي، سعر محترم، تقييم كويس."""
+    """عرض يستاهل: خصم حقيقي، سعر محترم، تقييم كويس وعدد تقييمات يطمّن، ومش منتج هامشي."""
     if not (MIN_DISCOUNT <= it["pct"] <= MAX_DISCOUNT):
         return False
     if it["price"] < MIN_PRICE:
         return False
-    if it.get("rating") is not None and it["rating"] < MIN_RATING:
+    if is_junk(it):
         return False
-    if it.get("reviews") is not None and it["reviews"] < MIN_REVIEWS:
+    rating, reviews = it.get("rating"), it.get("reviews")
+    if rating is None and reviews is None:
+        # مفيش أي بيانات تقييم: مانقدرش نتأكد، فنطلب عرض أقوى بكتير
+        return it["pct"] >= NO_DATA_MIN_PCT and it["price"] >= NO_DATA_MIN_PRICE
+    if rating is not None and rating < MIN_RATING:
+        return False
+    if reviews is not None and reviews < MIN_REVIEWS:
         return False
     return True
 
@@ -507,7 +526,10 @@ def scan_once():
         if stop or len(found) >= max(4, MAX_PER_ROUND * 2):
             break
 
-    best = sorted(found.values(), key=deal_score, reverse=True)[:min(MAX_PER_ROUND, left)]
+    ranked = sorted(found.values(), key=deal_score, reverse=True)
+    weak = sum(1 for x in ranked if deal_score(x) < MIN_SCORE)
+    ranked = [x for x in ranked if deal_score(x) >= MIN_SCORE]
+    best = ranked[:min(MAX_PER_ROUND, left)]
     results = []
     coupons = 0
     for it in best:
@@ -526,7 +548,7 @@ def scan_once():
         sent[it["asin"]] = {"price": it["price"], "ts": time.time(), "q": 1}
     save_sent(sent)
     msg = (f"scan: keywords={used} items={raw} low_quality={lowq} already_sent={skipped} "
-           f"good_new={len(found)} sent={len(results)} coupons={coupons} api_today={requests_today()} errors={len(errors)}")
+           f"good_new={len(found)} weak_score={weak} sent={len(results)} coupons={coupons} api_today={requests_today()} errors={len(errors)}")
     if errors:
         msg += " | " + " || ".join(errors[:3])
     log.info(msg)
