@@ -9,6 +9,7 @@ import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -126,6 +127,26 @@ async def clear_src(bot, item):
 
 
 # ---------------------------------------------------------------- handlers
+BUSY = set()  # مسودات بتتنشر دلوقتي (عشان الضغط المتكرر ميعملش بوست مكرر)
+
+
+async def safe_answer(q, text=None, alert=False):
+    """رد على الزرار من غير ما يوقّف الباقي لو الضغطة قديمة أو النت بطيء."""
+    try:
+        await q.answer(text, show_alert=alert)
+    except Exception as e:
+        log.warning("answer skipped: %s", type(e).__name__)
+
+
+async def publish_with_retry(bot, image, post):
+    """بينشر مرة واحدة. لو تليجرام قال استنى (RetryAfter) بيستنى ويعيد. على المهلة (TimedOut) مبيعيدش عشان ميتكررش البوست."""
+    try:
+        await send_post(bot, CHANNEL, image, post)
+    except RetryAfter as e:
+        await asyncio.sleep(min(int(getattr(e, "retry_after", 5)) + 1, 60))
+        await send_post(bot, CHANNEL, image, post)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if OWNER_ID == 0:
@@ -139,10 +160,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, _, val = (q.data or "").partition(":")
     uid = q.from_user.id
     if uid != OWNER_ID:
-        await q.answer("مش مسموحلك تستخدم الزرار ده.", show_alert=True)
+        await safe_answer(q, "مش مسموحلك تستخدم الزرار ده.", True)
         return
-    if action != "ed":
-        await q.answer()
+    if action == "pub":
+        await safe_answer(q, "⏳ جاري النشر...")
+    elif action != "ed":
+        await safe_answer(q)
 
     async def say(text, **kw):
         try:
@@ -154,7 +177,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not item:
         await say("البوست ده انتهى.")
         if action == "ed":
-            await q.answer()
+            await safe_answer(q)
         return
 
     if action == "cx":
@@ -170,18 +193,34 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 uid,
                 "✏️ انسخ النص اللي فوق، عدّل عليه، وابعته هنا.\nعشان تلغي التعديل ابعت: إلغاء",
             )
-            await q.answer()
+            await safe_answer(q)
         except Exception:
-            await q.answer("افتح البوت وابعتله /start الأول، وبعدين دوس تعديل تاني.", show_alert=True)
+            await safe_answer(q, "افتح البوت وابعتله /start الأول، وبعدين دوس تعديل تاني.", True)
         return
 
     if action == "pub":
+        if val in BUSY:
+            await say("⏳ البوست ده بيتنشر دلوقتي، استنى ثواني.")
+            return
+        BUSY.add(val)
         try:
-            await send_post(context.bot, CHANNEL, item["image"], item["post"])
+            await publish_with_retry(context.bot, item["image"], item["post"])
+        except TimedOut:
+            log.warning("publish timed out")
+            await say(
+                "⚠️ النت بطيء والرد اتأخر، وممكن البوست يكون اتنشر فعلاً.\n"
+                "راجع قناة عروض وخصومات الأول، ولو مش موجود دوس ✅ نشر تاني (المسودة لسه موجودة)."
+            )
+            return
         except Exception as e:
             log.exception("publish failed")
-            await say(f"معرفتش أنشر: {type(e).__name__}\nتأكد إن البوت أدمن في قناة عروض وخصومات.")
+            await say(
+                f"معرفتش أنشر: {type(e).__name__}\n"
+                "المسودة لسه موجودة، دوس ✅ نشر تاني. ولو اتكرر تأكد إن البوت أدمن في قناة عروض وخصومات."
+            )
             return
+        finally:
+            BUSY.discard(val)
         await clear_src(context.bot, item)
         drop_draft(val)
         await say("اتنشر في قناة عروض وخصومات ✅")
@@ -244,7 +283,18 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def build_app():
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)          # ضغطة بطيئة متعطلش الباقي
+        .connect_timeout(20)
+        .read_timeout(60)
+        .write_timeout(60)                 # رفع الصورة على نت ضعيف
+        .pool_timeout(20)
+        .get_updates_connect_timeout(20)
+        .get_updates_read_timeout(40)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
