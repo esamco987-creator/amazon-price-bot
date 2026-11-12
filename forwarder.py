@@ -128,9 +128,13 @@ def get_image(url, fallback_title=None):
         _, page = pb.get_page(url, [])
         if not page:
             return None
-        title, price, old, _, img = pb.read_product(page)
+        title, price, old, rating, img = pb.read_product(page)
         raw = pb.download_image(img)
-        return pb.product_image(title, price, old, raw)
+        try:
+            coupon = scanner.extract_coupon(page, pb.find_asin(url) or "")
+        except Exception:
+            coupon = None
+        return pb.product_image(title, price, old, raw, {"rating": rating, "coupon": coupon})
     except Exception as e:
         logging.warning("Image fetch failed: %s", type(e).__name__)
         return None
