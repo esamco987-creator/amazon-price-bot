@@ -1062,10 +1062,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
-    if app.job_queue:
-        app.job_queue.run_daily(daily_report, time=datetime.time(REPORT_HOUR, 0, tzinfo=report_tz()), name="daily_report")
-    else:
-        log.warning("job_queue مش متاح: التقرير اليومي موقوف (استخدم /stats)")
+    # التقرير اليومي بقى بيتبعت من الـforwarder (مجمّع مع إحصائيات القناة). /stats لسه شغال.
     log.info("compare bot running")
     app.run_polling()
 
