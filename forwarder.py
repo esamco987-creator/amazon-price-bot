@@ -17,6 +17,7 @@ import post_bot as pb
 import draft_bot as db
 import deals_scanner as scanner
 import promo_scanner as promos
+import daily_report
 import deal_card
 
 logging.basicConfig(level=logging.INFO)
@@ -29,8 +30,8 @@ SOURCES = ["arkhashomoffers", "OffersEgyptofficial", "Raw5aa"]
 PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
 FOOTER = (
-    "📢 للمزيد من العروض: t.me/PromoCodeOnlain\n"
-    "🔎 دوّر على أي منتج: t.me/Mix_Compare_bot"
+    "📢 قناتنا: @PromoCodeOnlain\n"
+    "🔎 ابحث عن أي منتج: @Mix_Compare_bot"
 )
 
 HEADERS = {
@@ -349,6 +350,16 @@ async def main():
         logging.info("Deal scanner on: discount >= %s%% every %s min", scanner.MIN_DISCOUNT, scanner.SCAN_EVERY // 60)
     else:
         logging.info("Deal scanner off (CREATORS_ID / CREATORS_SECRET not set)")
+    def send_report(text):
+        """التقرير اليومي: رسالة خاصة لصاحب القناة، ولو مش متاحة بنبعتها لقناة المسودات."""
+        ok = api("sendMessage", {"chat_id": db.OWNER_ID, "text": text, "parse_mode": "HTML",
+                                 "disable_web_page_preview": "true"})
+        if not ok:
+            api("sendMessage", {"chat_id": target_box["chat_id"], "text": text, "parse_mode": "HTML",
+                                "disable_web_page_preview": "true"})
+
+    asyncio.create_task(daily_report.loop(client, send_report))
+    logging.info("Daily report on: every day at %02d:%02d (Cairo)", daily_report.REPORT_HOUR, daily_report.REPORT_MIN)
     # سحب صفحات العروض (اشتري 3 بسعر 2...) موقوف بقرار صاحب القناة
     logging.info("Promo pages scanner off")
     await client.run_until_disconnected()
