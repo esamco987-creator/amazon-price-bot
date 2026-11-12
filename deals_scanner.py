@@ -46,9 +46,9 @@ MIN_REVIEWS = 3            # أقل عدد تقييمات (لو العدد مع�
 SCAN_EVERY = 5 * 60        # كل قد إيه يعيد الفحص (ثواني)
 KEYWORDS_PER_ROUND = 6     # عدد كلمات البحث في الدفعة
 MAX_BATCHES = 2            # أقصى عدد دفعات في الجولة (يعني 12 طلب بحث على الأكتر)
-MAX_PER_ROUND = 2          # أقصى عدد عروض بتتبعت في الجولة (أحسن واحد واتنين)
-HOURLY_CAP = 10            # أقصى عدد عروض في الساعة
-DAILY_CAP = 100            # أقصى عدد عروض في اليوم
+MAX_PER_ROUND = 1          # أقصى عدد عروض بتتبعت في الجولة (أحسن واحد كل 5 دقايق)
+HOURLY_CAP = 12            # أقصى عدد عروض في الساعة
+DAILY_CAP = 150            # أقصى عدد عروض في اليوم
 DAILY_REQUESTS = 6000      # أقصى طلبات API في اليوم (حد أمازون 8640)
 RATE_PAUSE = 10 * 60       # لو أمازون قالت "بطّأ" (429)، نوقف الفحص المدة دي
 RESEND_AFTER = 48 * 3600   # نفس المنتج ما يتبعتش تاني قبل المدة دي (إلا لو السعر نزل أكتر)
@@ -327,11 +327,18 @@ def deal_score(it):
     return it["pct"] * math.log10(it["price"] + 10) * quality * trust * bonus
 
 
+def quota_counts(sent):
+    """بيعدّ العروض اللي النسخة دي بعتتها (علامة q) في آخر ساعة وآخر 24 ساعة."""
+    now = time.time()
+    mine = [v for v in sent.values() if v.get("q")]
+    hour = sum(1 for v in mine if now - v["ts"] < 3600)
+    day = sum(1 for v in mine if now - v["ts"] < 86400)
+    return hour, day
+
+
 def quota_left(sent):
     """كام عرض لسه مسموح نبعته (حسب حد الساعة وحد اليوم)."""
-    now = time.time()
-    hour = sum(1 for v in sent.values() if now - v["ts"] < 3600)
-    day = sum(1 for v in sent.values() if now - v["ts"] < 86400)
+    hour, day = quota_counts(sent)
     return min(HOURLY_CAP - hour, DAILY_CAP - day)
 
 
@@ -463,7 +470,8 @@ def scan_once():
     sent = load_sent()
     left = quota_left(sent)
     if left <= 0:
-        note(f"scan skipped: sent-deals cap reached (hour {HOURLY_CAP} / day {DAILY_CAP})")
+        h, d = quota_counts(sent)
+        note(f"scan skipped: cap reached (last hour {h}/{HOURLY_CAP}, last 24h {d}/{DAILY_CAP})")
         return []
 
     pool = random.sample(KEYWORDS, len(KEYWORDS))
@@ -515,7 +523,7 @@ def scan_once():
                 if not image:
                     image = pb.prepare_image(raw_img)
         results.append((it, build_deal_post(it, compact=COMPACT_POST and card), image))
-        sent[it["asin"]] = {"price": it["price"], "ts": time.time()}
+        sent[it["asin"]] = {"price": it["price"], "ts": time.time(), "q": 1}
     save_sent(sent)
     msg = (f"scan: keywords={used} items={raw} low_quality={lowq} already_sent={skipped} "
            f"good_new={len(found)} sent={len(results)} coupons={coupons} api_today={requests_today()} errors={len(errors)}")
