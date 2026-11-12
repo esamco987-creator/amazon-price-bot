@@ -197,7 +197,7 @@ def draw_rating(card, d, rx, y, rating, reviews):
 def draw_coupon(card, d, rx, y, text):
     """شريط كوبون بلونه: [الكوبون:] + نص الكوبون."""
     tag = "الكوبون:"
-    tf, bf = font(27), font(30)
+    tf, bf = font(30), font(33)
     tw = int(width(d, tag, tf)) + 34
     avail = 590 - tw - 66
     line = f"{text}  •  فعّل الكوبون من صفحة المنتج"
@@ -206,7 +206,7 @@ def draw_coupon(card, d, rx, y, text):
     if width(d, line, bf) > avail:
         line = text
     bw = min(int(width(d, line, bf)) + 40, avail)
-    h = 56
+    h = 60
     x0 = rx - tw - bw - 56
     d.rounded_rectangle([x0 - 10, y - 8, rx + 10, y + h + 8], radius=12, fill=COUPON_BG, outline=COUPON_BORDER, width=3)
     d.rounded_rectangle([rx - tw, y, rx, y + h], radius=8, fill=YELLOW)
@@ -243,31 +243,31 @@ def make_card(item, raw_image):
         # عمود البيانات على اليسار (محاذاة لليمين)
         rx = 640
         colw = 590
-        tf = font(40)
+        tf = font(46)
         lines = wrap(d, item["title"], tf, colw, 3)
         y = 60
         for ln in lines:
             draw_text(d, (rx, y), ln, tf, INK, "ra")
-            y += 54
+            y += 62
 
         shift = 0
 
         # الشارة
         lt = current_label(item)
-        lf = font(27)
+        lf = font(31)
         lw = int(width(d, lt, lf)) + 44
         ly = max(y + 22 + shift, 250)
-        d.rounded_rectangle([rx - lw, ly, rx, ly + 46], radius=8, fill=CRIMSON)
-        draw_text(d, (rx - lw // 2, ly + 23), lt, lf, WHITE, "mm")
+        d.rounded_rectangle([rx - lw, ly, rx, ly + 52], radius=8, fill=CRIMSON)
+        draw_text(d, (rx - lw // 2, ly + 26), lt, lf, WHITE, "mm")
 
         # صف السعر: -% ثم السعر (مع الكسور صغيرة فوق) ثم جنيه
-        by = ly + 105  # خط الأساس
-        pf = font(58)
-        sf = font(26)
+        by = ly + 128  # خط الأساس
+        pf = font(72)
+        sf = font(32)
         x = rx
         if item.get("pct"):
             pct_txt = f"-{item['pct']}%"
-            pctf = font(38)
+            pctf = font(46)
             d.text((rx, by), pct_txt, font=pctf, fill=CRIMSON, anchor="rs")
             x = rx - d.textlength(pct_txt, font=pctf) - 28
 
@@ -276,18 +276,18 @@ def make_card(item, raw_image):
         frac = int(round((price - whole) * 100))
         if frac:
             ft = f"{frac:02d}"
-            d.text((x, by - 32), ft, font=sf, fill=INK, anchor="rs")
+            d.text((x, by - 40), ft, font=sf, fill=INK, anchor="rs")
             x -= d.textlength(ft, font=sf) + 4
         wt = f"{whole:,}"
         d.text((x, by), wt, font=pf, fill=INK, anchor="rs")
         x -= d.textlength(wt, font=pf) + 10
-        draw_text(d, (x, by - 4), "جنيه", font(24), INK, "rs")
+        draw_text(d, (x, by - 6), "جنيه", font(30), INK, "rs")
 
         gy = by
         if item.get("old") and item["old"] > item["price"]:
             # سعر القائمة
-            gy = by + 46
-            of = font(26)
+            gy = by + 56
+            of = font(31)
             lab = "سعر القائمة:"
             draw_text(d, (rx, gy), lab, of, MUTED, "rs")
             x = rx - width(d, lab, of) - 12
@@ -298,8 +298,8 @@ def make_card(item, raw_image):
 
             # التوفير
             save = item["old"] - item["price"]
-            draw_text(d, (rx, gy + 48), f"وفّر {money(save)} جنيه", font(28), GREEN, "rs")
-            gy += 48
+            draw_text(d, (rx, gy + 54), f"وفّر {money(save)} جنيه", font(34), GREEN, "rs")
+            gy += 54
 
         coupon = (item.get("coupon") or "").strip()
         if coupon:
