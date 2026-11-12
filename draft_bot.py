@@ -90,6 +90,8 @@ def drop_draft(pid):
 
 
 def plain(post):
+    # اللينك المخفي (<a href=...>) بيتحوّل للينك ظاهر عشان ميضيعش وقت التعديل
+    post = re.sub(r'<a href="([^"]+)">[^<]*</a>', r"\1", post)
     return html.unescape(re.sub(r"<[^>]+>", "", post))
 
 
