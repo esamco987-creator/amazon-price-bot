@@ -6,6 +6,9 @@ import asyncio
 import logging
 import threading
 from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import Update
@@ -19,7 +22,7 @@ for _n in ("httpx", "httpcore", "telegram", "apscheduler", "urllib3"):
 log = logging.getLogger("price_bot")
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
-CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "3600"))  # كل ساعة
+CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "1800"))  # كل نص ساعة
 AFFILIATE_TAG = "mixdeals-21"  # اللينك في التنبيه بيبقى بكودك. امسحه لو مش عايز: ""
 MAX_ITEMS = 25  # أقصى عدد منتجات لكل شخص
 
@@ -71,15 +74,107 @@ def link_for(p):
     return f"{base}?tag={AFFILIATE_TAG}" if AFFILIATE_TAG else base
 
 
+SHORT_HOSTS = ("amzn.", "a.co", "link.amazon", "amzn.to", "amzn.eu")
+_session = threading.local()
+CAPTCHA_MARKS = ("api-services-support@amazon.com", "Type the characters you see", "Enter the characters you see",
+                 "/errors/validateCaptcha", "اكتب الأحرف")
+# أي سعر جوه أقسام المنتجات المقترحة/الإعلانات ده مش سعر المنتج
+BAD_ANCESTOR_IDS = ("sims", "similar", "sp_detail", "sponsored", "anonCarousel", "purchase-sims", "bundle",
+                    "percolate", "rhf", "recently", "customer-reviews", "ad-", "a-carousel")
+PRICE_ROOTS = (
+    "#corePriceDisplay_desktop_feature_div",
+    "#corePrice_feature_div",
+    "#apex_desktop",
+    "#apex_offerDisplay_desktop",
+    "#desktop_buybox",
+    "#buybox",
+    "#qualifiedBuybox",
+    "#tabular-buybox",
+    "#centerCol",   # احتياطي: العمود الرئيسي للمنتج (الأقسام المقترحة بتتفلتر برضه)
+    "#ppd",
+)
+
+
+def _sess():
+    s = getattr(_session, "s", None)
+    if s is None:
+        s = requests.Session()
+        _session.s = s
+    return s
+
+
+def get_html(url, debug, tries=3):
+    """يجيب صفحة المنتج بسرعة: جلسة مفتوحة، مهلة قصيرة، ومحاولات بهيدرز مختلفة. صفحة الكابتشا بتتعامل كفشل."""
+    last = ""
+    for i in range(tries):
+        headers = pb.HEADER_STRATEGIES[i % len(pb.HEADER_STRATEGIES)]
+        try:
+            r = _sess().get(url, headers=headers, timeout=(6, 15), allow_redirects=True)
+            body = r.text or ""
+            if r.status_code == 200 and "productTitle" in body and not any(m in body for m in CAPTCHA_MARKS[:3]):
+                return r.url, body
+            last = f"حالة {r.status_code}" + (" (كابتشا)" if any(m in body for m in CAPTCHA_MARKS) else "")
+        except Exception as e:
+            last = type(e).__name__
+        debug.append(f"محاولة {i + 1}: {last}")
+        time.sleep(1.5 * (i + 1))
+    return None, ""
+
+
+def _in_bad_section(el, root):
+    for a in el.parents:
+        if a is root:
+            break
+        ident = " ".join(filter(None, [a.get("id", ""), " ".join(a.get("class", []) or [])])).lower()
+        if ident and any(b.lower() in ident for b in BAD_ANCESTOR_IDS):
+            return True
+    return False
+
+
+def read_price(soup):
+    """سعر المنتج الأساسي بس (من صندوق الشراء). لو مش لاقيه يرجع None بدل ما يخمّن سعر منتج تاني."""
+    for sel in PRICE_ROOTS:
+        root = soup.select_one(sel)
+        if not root:
+            continue
+        for el in root.select(".a-price:not(.a-text-price)"):
+            if el.get("data-a-strike") == "true" or _in_bad_section(el, root):
+                continue
+            off = el.select_one(".a-offscreen")
+            v = num(off.get_text(" ", strip=True)) if off else None
+            if v:
+                return v
+    for sel in ("#priceblock_dealprice", "#priceblock_ourprice", "#price_inside_buybox"):
+        el = soup.select_one(sel)
+        if el:
+            v = num(el.get_text(" ", strip=True))
+            if v:
+                return v
+    return None
+
+
+def page_asin(soup):
+    el = soup.select_one("input#ASIN") or soup.select_one("input[name='ASIN']")
+    if el and el.get("value"):
+        return el["value"].strip().upper()
+    link = soup.find("link", rel="canonical")
+    return (pb.find_asin(link.get("href", "")) if link else None)
+
+
 def fetch_product(url, debug):
     """يرجع dict فيه asin/host/title/price أو None."""
-    try:
-        final, body = pb.resolve(url, pb.HEADER_STRATEGIES[0])
-    except Exception as e:
-        debug.append(f"فتح الرابط: {type(e).__name__}")
-        return None
-    host = urlparse(final).netloc.lower()
-    asin = pb.find_asin(final) or pb.find_asin(url) or pb.find_asin(body)
+    host = urlparse(url).netloc.lower()
+    asin = pb.find_asin(url)
+    final = url
+    if not asin or any(h in host for h in SHORT_HOSTS):
+        # لينك مختصر: لازم نفكّه الأول. أما اللينك المباشر فمفيش داعي نضيع طلب
+        try:
+            final, body = pb.resolve(url, pb.HEADER_STRATEGIES[0])
+        except Exception as e:
+            debug.append(f"فتح الرابط: {type(e).__name__}")
+            return None
+        host = urlparse(final).netloc.lower()
+        asin = pb.find_asin(final) or pb.find_asin(url) or pb.find_asin(body)
     if not asin:
         return None
     if "amazon." not in host or host.startswith("link."):
@@ -88,13 +183,20 @@ def fetch_product(url, debug):
 
 
 def fetch_by_asin(host, asin, debug):
-    _, page = pb.get_page(f"https://{host}/dp/{asin}", debug)
+    _, page = get_html(f"https://{host}/dp/{asin}", debug)
     if not page:
         return None
-    title, price, old, rating, img = pb.read_product(page)
+    soup = BeautifulSoup(page, "html.parser")
+    shown = page_asin(soup)
+    if shown and shown != asin.upper():
+        # الصفحة اتحولت لمنتج/موديل تاني: مانثقش في سعرها
+        log.warning("asin mismatch: wanted %s page shows %s", asin, shown)
+        debug.append("الصفحة بتعرض منتج مختلف")
+        return None
+    title, _, _, _, _ = pb.read_product(page)
     if not title:
         return None
-    return {"asin": asin, "host": host, "title": title, "price": price}
+    return {"asin": asin, "host": host, "title": title, "price": read_price(soup)}
 
 
 # ---------------------------------------------------------------- commands
@@ -234,17 +336,25 @@ def decide(p, price):
 
 async def check_chat(bot, chat, always_report=False):
     items = tracked.get(chat, [])
-    for p in list(items):
-        try:
-            prod = await asyncio.to_thread(fetch_by_asin, p["host"], p["asin"], [])
-        except Exception as e:
-            log.warning("check failed: %s", type(e).__name__)
-            prod = None
+    sem = asyncio.Semaphore(3)  # 3 منتجات في نفس الوقت على الأكتر
+
+    async def fetch(p):
+        async with sem:
+            try:
+                prod = await asyncio.to_thread(fetch_by_asin, p["host"], p["asin"], [])
+            except Exception as e:
+                log.warning("check failed: %s", type(e).__name__)
+                prod = None
+            await asyncio.sleep(1)
+            return prod
+
+    snapshot = list(items)
+    results = await asyncio.gather(*(fetch(p) for p in snapshot))
+    for p, prod in zip(snapshot, results):
         price = prod["price"] if prod else None
         if price is None:
             if always_report:
                 await bot.send_message(int(chat), f"{p['title'][:50]}\nمقدرتش أجيب سعره دلوقتي.")
-            await asyncio.sleep(4)
             continue
         old = p["last"]
         notify = decide(p, price)
@@ -265,7 +375,6 @@ async def check_chat(bot, chat, always_report=False):
                 log.warning("notify failed: %s", type(e).__name__)
         elif always_report:
             await bot.send_message(int(chat), f"{p['title'][:50]}\nالسعر: {pb.fmt(price)}")
-        await asyncio.sleep(4)
 
 
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
@@ -303,7 +412,15 @@ def main():
     if os.environ.get("PORT"):
         threading.Thread(target=run_server, daemon=True).start()
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)   # مستخدم بطيء ميوقّفش الباقي
+        .connect_timeout(20)
+        .read_timeout(40)
+        .write_timeout(40)
+        .build()
+    )
     if app.job_queue is None:
         print("job-queue مش متثبتة. نفّذ: pip install 'python-telegram-bot[job-queue]'")
         return
