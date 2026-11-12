@@ -1053,7 +1053,15 @@ def main():
     if not OWNER_ID:
         raise SystemExit("OWNER_ID مش موجود")
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)   # بحث مستخدم بطيء ميوقّفش الباقي
+        .connect_timeout(20)
+        .read_timeout(40)
+        .write_timeout(60)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("votes", cmd_votes))
     app.add_handler(CommandHandler("announce", cmd_announce))
