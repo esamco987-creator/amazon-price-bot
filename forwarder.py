@@ -77,6 +77,37 @@ def clean_lines(raw):
     return lines
 
 
+TRACKING_PARAMS = {
+    "linkcode", "linkid", "ref", "ref_", "ascsubtag", "btn_type", "btn_ref", "srctok", "creative", "creativeasin",
+    "camp", "_encoding", "content-id", "pd_rd_r", "pd_rd_w", "pd_rd_wg", "pf_rd_p", "pf_rd_r", "pf_rd_s", "pf_rd_t",
+    "pf_rd_i", "pf_rd_m", "psc", "qid", "sr", "crid", "sprefix", "th", "language", "social_share", "gclid", "fbclid",
+}
+LONG_LINK = 110  # لينك أطول من كده بيتحط تحت كلمة قابلة للضغط بدل ما يظهر كله
+
+
+def clean_amazon_url(final):
+    """بيشيل بارامترات التتبع الطويلة من لينك أمازون (بحث/قسم) ويسيب بس اللي بيحدد الصفحة + كودك."""
+    try:
+        base, _, query = final.partition("?")
+        query = query.split("#", 1)[0].split(";", 1)[0]
+        keep = []
+        for part in query.split("&"):
+            if not part:
+                continue
+            key = part.split("=", 1)[0].lower()
+            if key in TRACKING_PARAMS or key == "tag":
+                continue
+            keep.append(part)
+        keep.append(f"tag={MY_TAG}")
+        return base + "?" + "&".join(keep)
+    except Exception:
+        return final
+
+
+def is_product_url(url):
+    return bool(pb.find_asin(url))
+
+
 def to_my_link(url):
     """يحوّل لينك أمازون للينك بكودك. أي لينك تاني بيرجع زي ما هو."""
     if not AMAZON_RE.search(url):
@@ -92,10 +123,7 @@ def to_my_link(url):
         asin = pb.find_asin(final) or pb.find_asin(url) or pb.find_asin(body)
         if asin:
             return f"https://{host}/dp/{asin}?tag={MY_TAG}"
-        if "tag=" in final:
-            return re.sub(r"([?&])tag=[^&]*", r"\1tag=" + MY_TAG, final)
-        sep = "&" if "?" in final else "?"
-        return f"{final}{sep}tag={MY_TAG}"
+        return clean_amazon_url(final)
     except Exception as e:
         logging.warning("Link resolve failed: %s", type(e).__name__)
         return url
@@ -125,10 +153,15 @@ def get_image(url, fallback_title=None):
             return None
         if "/promotion/" in url:
             return promo_image(url, fallback_title)
+        if not is_product_url(url):
+            # لينك بحث/قسم مش منتج واحد: مفيش كارت (كان بيطلع كارت من غير اسم وبسعر أول نتيجة)
+            return None
         _, page = pb.get_page(url, [])
         if not page:
             return None
         title, price, old, rating, img = pb.read_product(page)
+        if not title:
+            return None
         raw = pb.download_image(img)
         try:
             coupon = scanner.extract_coupon(page, pb.find_asin(url) or "")
@@ -165,7 +198,11 @@ def build_post(lines, urls):
     if rest:
         parts.append(esc(rest))
     if single and urls:
-        parts.append("🛒 اشتري من هنا:\n" + esc(urls[0]))
+        u = urls[0]
+        if len(u) > LONG_LINK:
+            parts.append(f'🛒 <a href="{html.escape(u, quote=True)}">اضغط هنا لفتح العرض على أمازون</a>')
+        else:
+            parts.append("🛒 اشتري من هنا:\n" + esc(u))
     parts.append(esc(FOOTER))
     return "\n\n".join(parts)
 
