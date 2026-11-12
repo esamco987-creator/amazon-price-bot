@@ -6,6 +6,7 @@
 """
 import io
 import os
+import math
 import logging
 
 import requests
@@ -144,6 +145,80 @@ MUTED = (86, 89, 89)
 CRIMSON = (204, 12, 57)
 
 
+STAR = (245, 166, 35)
+STAR_OFF = (214, 217, 222)
+LINKBLUE = (22, 94, 148)
+COUPON_BG = (236, 247, 240)
+COUPON_BORDER = (170, 214, 188)
+
+
+def _star_mask(size):
+    """قناع نجمة (مرسوم بحجم كبير وبعدين متصغّر عشان الحواف تطلع ناعمة)."""
+    big = size * 4
+    m = Image.new("L", (big, big), 0)
+    pts = []
+    for i in range(10):
+        r = big / 2 if i % 2 == 0 else big / 2 * 0.42
+        a = -math.pi / 2 + i * math.pi / 5
+        pts.append((big / 2 + r * math.cos(a), big / 2 + r * math.sin(a) + big * 0.03))
+    ImageDraw.Draw(m).polygon(pts, fill=255)
+    return m.resize((size, size), Image.LANCZOS)
+
+
+def draw_stars(card, right, cy, rating, size=34, gap=4):
+    """5 نجوم من اليمين لليسار، متعبّية بنسبة التقييم. يرجع x لآخر نجمة (الشمال)."""
+    mask = _star_mask(size)
+    x = right
+    for i in range(5):
+        fill = max(0.0, min(1.0, rating - i))
+        x0 = x - size
+        y0 = cy - size // 2
+        card.paste(Image.new("RGB", (size, size), STAR_OFF), (x0, y0), mask)
+        if fill > 0:
+            w = max(1, int(size * fill))
+            part = Image.new("RGB", (w, size), STAR)
+            # التعبئة من اليمين لليسار
+            card.paste(part, (x - w, y0), mask.crop((size - w, 0, size, size)))
+        x = x0 - gap
+    return x + gap
+
+
+def draw_rating(card, d, rx, y, rating, reviews):
+    """صف التقييم: رقم التقييم + نجوم + عدد التقييمات."""
+    nf = font(34)
+    rt = f"{rating:.1f}"
+    d.text((rx, y), rt, font=nf, fill=INK, anchor="rm")
+    x = rx - d.textlength(rt, font=nf) - 12
+    x = draw_stars(card, int(x), y, rating)
+    if reviews:
+        d.text((x - 14, y), f"({reviews:,})", font=font(32), fill=LINKBLUE, anchor="rm")
+
+
+def draw_coupon(card, d, rx, y, text):
+    """شريط كوبون بلونه: [الكوبون:] + نص الكوبون."""
+    tag = "الكوبون:"
+    tf, bf = font(27), font(30)
+    tw = int(width(d, tag, tf)) + 34
+    avail = 590 - tw - 66
+    line = f"{text}  •  فعّل الكوبون من صفحة المنتج"
+    if width(d, line, bf) > avail:
+        line = f"{text}  •  فعّل الكوبون"
+    if width(d, line, bf) > avail:
+        line = text
+    bw = min(int(width(d, line, bf)) + 40, avail)
+    h = 56
+    x0 = rx - tw - bw - 56
+    d.rounded_rectangle([x0 - 10, y - 8, rx + 10, y + h + 8], radius=12, fill=COUPON_BG, outline=COUPON_BORDER, width=3)
+    d.rounded_rectangle([rx - tw, y, rx, y + h], radius=8, fill=YELLOW)
+    draw_text(d, (rx - tw // 2, y + h // 2), tag, tf, NAVY, "mm")
+    # علامة صح
+    cx, cy2 = rx - tw - 34, y + h // 2
+    d.ellipse([cx - 17, cy2 - 17, cx + 17, cy2 + 17], fill=GREEN)
+    d.line([cx - 8, cy2, cx - 2, cy2 + 7, cx + 9, cy2 - 7], fill=WHITE, width=5, joint="curve")
+    lines = wrap(d, line, bf, bw + 20, 1)
+    draw_text(d, (rx - tw - 62, y + h // 2), lines[0], bf, (22, 100, 58), "rm")
+
+
 def make_card(item, raw_image):
     """كارت أفقي: صورة المنتج يمين، والبيانات شمالها، وشريط القناة تحت.
     item فيه title, price, old, pct. يرجع JPEG بايتات أو None."""
@@ -168,29 +243,31 @@ def make_card(item, raw_image):
         # عمود البيانات على اليسار (محاذاة لليمين)
         rx = 640
         colw = 590
-        tf = font(48)
+        tf = font(40)
         lines = wrap(d, item["title"], tf, colw, 3)
         y = 60
         for ln in lines:
             draw_text(d, (rx, y), ln, tf, INK, "ra")
-            y += 64
+            y += 54
+
+        shift = 0
 
         # الشارة
         lt = current_label(item)
-        lf = font(34)
+        lf = font(27)
         lw = int(width(d, lt, lf)) + 44
-        ly = max(y + 24, 290)
-        d.rounded_rectangle([rx - lw, ly, rx, ly + 52], radius=8, fill=CRIMSON)
-        draw_text(d, (rx - lw // 2, ly + 26), lt, lf, WHITE, "mm")
+        ly = max(y + 22 + shift, 250)
+        d.rounded_rectangle([rx - lw, ly, rx, ly + 46], radius=8, fill=CRIMSON)
+        draw_text(d, (rx - lw // 2, ly + 23), lt, lf, WHITE, "mm")
 
         # صف السعر: -% ثم السعر (مع الكسور صغيرة فوق) ثم جنيه
-        by = ly + 150  # خط الأساس
-        pf = font(96)
-        sf = font(40)
+        by = ly + 105  # خط الأساس
+        pf = font(58)
+        sf = font(26)
         x = rx
         if item.get("pct"):
             pct_txt = f"-{item['pct']}%"
-            pctf = font(56)
+            pctf = font(38)
             d.text((rx, by), pct_txt, font=pctf, fill=CRIMSON, anchor="rs")
             x = rx - d.textlength(pct_txt, font=pctf) - 28
 
@@ -199,17 +276,18 @@ def make_card(item, raw_image):
         frac = int(round((price - whole) * 100))
         if frac:
             ft = f"{frac:02d}"
-            d.text((x, by - 52), ft, font=sf, fill=INK, anchor="rs")
+            d.text((x, by - 32), ft, font=sf, fill=INK, anchor="rs")
             x -= d.textlength(ft, font=sf) + 4
         wt = f"{whole:,}"
         d.text((x, by), wt, font=pf, fill=INK, anchor="rs")
-        x -= d.textlength(wt, font=pf) + 14
-        draw_text(d, (x, by - 8), "جنيه", font(34), INK, "rs")
+        x -= d.textlength(wt, font=pf) + 10
+        draw_text(d, (x, by - 4), "جنيه", font(24), INK, "rs")
 
+        gy = by
         if item.get("old") and item["old"] > item["price"]:
             # سعر القائمة
-            gy = by + 62
-            of = font(34)
+            gy = by + 46
+            of = font(26)
             lab = "سعر القائمة:"
             draw_text(d, (rx, gy), lab, of, MUTED, "rs")
             x = rx - width(d, lab, of) - 12
@@ -220,7 +298,12 @@ def make_card(item, raw_image):
 
             # التوفير
             save = item["old"] - item["price"]
-            draw_text(d, (rx, gy + 56), f"وفّر {money(save)} جنيه", font(38), GREEN, "rs")
+            draw_text(d, (rx, gy + 48), f"وفّر {money(save)} جنيه", font(28), GREEN, "rs")
+            gy += 48
+
+        coupon = (item.get("coupon") or "").strip()
+        if coupon:
+            draw_coupon(card, d, rx, min(gy + 34, H - 100 - 82), coupon)
 
         # شريط القناة تحت
         d.rectangle([0, H - 100, W, H], fill=NAVY)
