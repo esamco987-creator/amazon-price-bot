@@ -44,12 +44,12 @@ MIN_PRICE = 120            # أقل سعر للمنتج (نشيل المنتجا
 MIN_RATING = 4.0           # أقل تقييم (لو المنتج عليه تقييم)
 MIN_REVIEWS = 15           # أقل عدد تقييمات (لو العدد معروف)
 SCAN_EVERY = 5 * 60        # كل قد إيه يعيد الفحص (ثواني)
-KEYWORDS_PER_ROUND = 6     # عدد كلمات البحث في الدفعة
-MAX_BATCHES = 2            # أقصى عدد دفعات في الجولة (يعني 12 طلب بحث على الأكتر)
-MAX_PER_ROUND = 1          # أقصى عدد عروض بتتبعت في الجولة (أحسن واحد كل 5 دقايق)
-HOURLY_CAP = 12            # أقصى عدد عروض في الساعة
-DAILY_CAP = 150            # أقصى عدد عروض في اليوم
-DAILY_REQUESTS = 6000      # أقصى طلبات API في اليوم (حد أمازون 8640)
+KEYWORDS_PER_ROUND = 8     # عدد كلمات البحث في الدفعة
+MAX_BATCHES = 3            # أقصى عدد دفعات في الجولة (24 طلب بحث على الأكتر، والدفعة التالتة بتتعمل بس لو لسه مفيش عروض كفاية)
+MAX_PER_ROUND = 2          # أقصى عدد عروض بتتبعت في الجولة (أحسن اتنين كل 5 دقايق)
+HOURLY_CAP = 20            # أقصى عدد عروض في الساعة
+DAILY_CAP = 220            # أقصى عدد عروض في اليوم
+DAILY_REQUESTS = 7500      # أقصى طلبات API في اليوم (حد أمازون 8640)
 RATE_PAUSE = 10 * 60       # لو أمازون قالت "بطّأ" (429)، نوقف الفحص المدة دي
 MIN_SCORE = 95             # أقل "درجة" للعرض عشان يتبعت (الأضعف مش بيتبعت حتى لو عدّى الفلاتر)
 NO_DATA_MIN_PCT = 50       # لو التقييم مش معروف: لازم خصم أكبر
@@ -86,6 +86,44 @@ KEYWORDS = [
     "بنطلون", "تيشيرت", "فستان", "قميص", "جزمة", "شبشب", "كوتشي", "ساعة كاسيو", "نظارة شمس",
     "قهوة", "شاي", "زيت", "منظفات", "مساحيق غسيل", "مكملات غذائية", "بروتين", "فيتامين د",
 ]
+
+# توسعة نطاق البحث: ماركات وأقسام وكلمات إنجليزي (أمازون مصر عناوينها كتير بالإنجليزي) وكلمات عروض عامة
+KEYWORDS += [
+    # كلمات عروض عامة
+    "عرض اليوم", "تخفيضات", "خصم كبير", "تصفية", "اقل سعر", "عروض الجمعة البيضاء", "اوفر", "خصم 50%",
+    # إلكترونيات (إنجليزي)
+    "headphones", "earbuds", "smart watch", "laptop", "gaming laptop", "monitor", "keyboard", "mouse", "router",
+    "power bank", "charger", "tablet", "smartphone", "speaker", "soundbar", "camera", "ssd", "usb flash drive",
+    "gaming chair", "controller", "projector", "smart tv", "air fryer", "robot vacuum", "coffee machine",
+    # ماركات إلكترونيات وأجهزة
+    "Anker", "JBL", "Logitech", "Asus", "Acer", "MSI", "Honor", "Nokia", "Tecno", "Dyson", "Philips", "Braun",
+    "Tefal", "Bosch", "Kenwood", "Panasonic", "Hisense", "TCL", "Midea", "Zanussi", "Beko", "Ariston", "Tornado",
+    "Black+Decker", "Oral-B", "Xiaomi", "Samsung", "Apple", "Lenovo", "HP", "Sony", "Canon", "Baseus", "Ugreen",
+    "Realme", "Oppo", "Huawei", "Infinix", "Remington", "Babyliss", "Moulinex", "Russell Hobbs", "Cuisinart",
+    # ملابس وأحذية وإكسسوارات
+    "Nike", "Adidas", "Puma", "Skechers", "Reebok", "Under Armour", "Levis", "Casio", "Fossil", "Skagen",
+    "sneakers", "sandals", "backpack", "wallet", "perfume", "watch men", "watch women", "sunglasses", "jacket",
+    "hoodie", "jeans", "dress", "pajamas", "ملابس داخلية", "طقم رياضي", "شنطة يد", "حذاء كاجوال", "صندل",
+    # جمال وعناية وصحة
+    "Nivea", "Garnier", "Loreal", "Maybelline", "Dove", "Vichy", "La Roche Posay", "Cerave", "Neutrogena",
+    "hair dryer", "straightener", "trimmer", "shaver", "serum", "sunscreen", "face wash", "protein powder",
+    "vitamins", "collagen", "omega 3", "مرطب", "واقي شمس", "سيروم", "كولاجين", "اوميجا", "مكمل",
+    # أطفال
+    "Pampers", "Huggies", "Molfix", "Johnson", "Chicco", "Fisher Price", "Lego", "Hot Wheels", "Barbie",
+    "عربة اطفال", "كرسي سيارة", "رضاعة", "ملابس مواليد", "العاب تعليمية",
+    # بيت ومطبخ
+    "Tefal pan", "Pyrex", "Luminarc", "Lock&Lock", "Bosch washing machine", "vacuum cleaner", "blender",
+    "kettle", "toaster", "iron", "fan", "heater", "water heater", "mattress", "pillow", "bedsheet", "curtains",
+    "carpet", "lamp", "led light", "tool set", "drill", "toolbox", "organizer", "طقم مفارش", "لحاف", "بطانية",
+    "مكنسة كهربائية", "طقم ادوات مائدة", "سكاكين", "حلة ضغط", "ترمس", "حافظة طعام",
+    # سيارات ورياضة
+    "dash cam", "car vacuum", "car charger", "tire inflator", "اكسسوارات سيارات", "زيت محرك", "بطارية سيارة",
+    "dumbbell", "yoga mat", "treadmill", "bicycle", "camping", "fitness tracker", "كرة قدم", "جيم",
+    # سوبر ماركت
+    "Nescafe", "Lipton", "Lavazza", "Nutella", "Pringles", "Dettol", "Ariel", "Persil", "Fairy", "Comfort", "Pampers pants",
+    "نسكافيه", "لافازا", "مكرونة", "ارز", "سمن", "عسل", "مكسرات", "تمر",
+]
+KEYWORDS = list(dict.fromkeys(KEYWORDS))
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SENT_FILE = os.path.join(BASE, "scanner_sent.json")
@@ -503,7 +541,7 @@ def scan_once():
         for kw in kws:
             used += 1
             try:
-                data = search(kw, random.choice([1, 1, 1, 2, 2, 3, 4, 5]))
+                data = search(kw, random.choice([1, 1, 2, 2, 3, 3, 4, 5, 6, 7]))
             except RateLimited as e:
                 _state["pause_until"] = time.time() + RATE_PAUSE
                 note(f"RATE LIMITED (429) -> pause {RATE_PAUSE // 60} min: {e}")
@@ -523,7 +561,7 @@ def scan_once():
                 else:
                     skipped += 1
             time.sleep(2)
-        if stop or len(found) >= max(4, MAX_PER_ROUND * 2):
+        if stop or len(found) >= max(5, MAX_PER_ROUND * 3):
             break
 
     ranked = sorted(found.values(), key=deal_score, reverse=True)
@@ -547,7 +585,7 @@ def scan_once():
         results.append((it, build_deal_post(it, compact=COMPACT_POST and card), image))
         sent[it["asin"]] = {"price": it["price"], "ts": time.time(), "q": 1}
     save_sent(sent)
-    msg = (f"scan: keywords={used} items={raw} low_quality={lowq} already_sent={skipped} "
+    msg = (f"scan: pool={len(KEYWORDS)} keywords={used} items={raw} low_quality={lowq} already_sent={skipped} "
            f"good_new={len(found)} weak_score={weak} sent={len(results)} coupons={coupons} api_today={requests_today()} errors={len(errors)}")
     if errors:
         msg += " | " + " || ".join(errors[:3])
