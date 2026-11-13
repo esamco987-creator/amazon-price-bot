@@ -482,7 +482,7 @@ def coupon_lines(item):
 
 def build_deal_post(item, compact=False):
     hot = item["pct"] >= HOT_DISCOUNT
-    head = f"🚨 خصم {item['pct']}% — عرض ممتاز ما يتفوتش!" if hot else f"🔥 خصم {item['pct']}%"
+    head = pb.opener(item["pct"], item.get("title", ""), hot)
     link = pb.affiliate(MARKETPLACE, item["asin"])
     if compact:
         # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
