@@ -152,19 +152,19 @@ def _crop_has_price(im, box, price):
     x0, y0, x1, y1 = [int(v) for v in _clamp(box, im)]
     if x1 - x0 < 20 or y1 - y0 < 10:
         return False
-    crop = im.crop((x0, y0, x1, y1))
-    crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
+    crop0 = im.crop((x0, y0, x1, y1))
     want = str(int(price))
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "c.png")
-        crop.save(p)
-        for psm in ("6", "7"):
-            try:
-                r = subprocess.run([exe, p, "stdout", "-l", "eng", "--psm", psm], capture_output=True, text=True, timeout=30)
-            except Exception:
-                return False
-            if want in re.sub(r"\D", "", r.stdout):
-                return True
+        for scale in (3, 4, 6):
+            crop0.resize((crop0.width * scale, crop0.height * scale), Image.LANCZOS).save(p)
+            for psm in ("6", "11"):
+                try:
+                    r = subprocess.run([exe, p, "stdout", "-l", "eng", "--psm", psm], capture_output=True, text=True, timeout=30)
+                except Exception:
+                    return False
+                if want in re.sub(r"\D", "", r.stdout):
+                    return True
     return False
 
 
@@ -177,6 +177,8 @@ def find_price_box(words, price, pct=None, top_limit=0, im=None):
         return box
     cands = []
     b = find_price_box_by_pct(words, price, pct, top_limit)
+    if b and pct:
+        return b          # قرينا نفس نسبة الخصم المعروفة من الصفحة (±1): مرساة موثوقة
     if b:
         cands.append(b)
     if im is not None:
@@ -265,18 +267,22 @@ def find_coupon_boxes(words, below_y, im=None, right_edge=None):
 
 
 def find_rating_box(words, above_y):
-    """صف التقييم (رقم 3.4 + عدد المراجعات (35)) فوق السعر — عشان نشيله."""
-    num = [w for w in words if re.fullmatch(r"[1-5][.,]\d", w["t"]) and w["tp"] < above_y]
-    if not num:
+    """صف التقييم: لازم رقم التقييم (4.2) وعدد المراجعات بين أقواس ((2,449)) على نفس السطر؛ عشان منمسحش أرقام من العنوان."""
+    nums = [w for w in words if re.fullmatch(r"[1-5][.,]\d", w["t"]) and w["tp"] < above_y]
+    counts = [w for w in words if re.fullmatch(r"\(\d[\d,.]*\)?", w["t"]) and w["tp"] < above_y]
+    best = None
+    for n in nums:
+        cy = n["tp"] + n["h"] / 2
+        for c in counts:
+            if abs((c["tp"] + c["h"] / 2) - cy) < n["h"] * 0.8 and abs(c["l"] - n["l"]) < n["w"] * 12:
+                best = (n, c)
+    if not best:
         return None
-    n = num[-1]
-    cy = n["tp"] + n["h"] / 2
-    row = [w for w in words if abs((w["tp"] + w["h"] / 2) - cy) < n["h"] * 0.9
-           and (re.fullmatch(r"[1-5][.,]\d", w["t"]) or re.fullmatch(r"\(?[\d,]+\)?", w["t"]))
-           and abs(w["l"] - n["l"]) < n["w"] * 14]
-    x0 = min(w["l"] for w in row) - 12
-    x1 = max(w["l"] + w["w"] for w in row) + 12
-    return [x0, n["tp"] - 5, x1, n["tp"] + n["h"] + 5]
+    n, c = best
+    x0 = min(n["l"], c["l"]) - 3
+    x1 = max(n["l"] + n["w"], c["l"] + c["w"]) + 3
+    top = min(n["tp"], c["tp"]) - 4
+    return [x0, top, x1, max(n["tp"] + n["h"], c["tp"] + c["h"]) + 4]
 
 
 def _clamp(box, im):
