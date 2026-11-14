@@ -48,13 +48,40 @@ CANVAS = 1080
 PRODUCT_BOX = 0.80
 LOGO_RATIO = 0.16
 
-OPENERS = [
-    "🔥 عرض يستاهل تلحقه!",
-    "⚡ فرصة حلوة متتفوتش!",
-    "💥 لقينالك عرض جامد!",
-    "🛍️ عرض النهاردة مختلف!",
-    "😍 ده من العروض اللي بتخلص بسرعة!",
+OPENERS = [   # قديمة (احتياطي لو مفيش خصم ولا اسم منتج)
+    "🔥 شوف العرض ده!",
+    "⚡ متفوتش العرض ده!",
+    "🛍️ من عروض اليوم",
+    "✅ متاح حاليًا",
 ]
+
+
+def short_name(title, words=4, limit=34):
+    """اسم المنتج المختصر (أول كام كلمة) للجُمل اللي بتبدأ بيها البوستات."""
+    t = re.sub(r"\s+", " ", re.sub(r"[\(\[\|\-–—،,].*$", "", title or "")).strip()
+    t = " ".join(t.split()[:words])
+    return t[:limit].strip()
+
+
+def opener(pct=None, title="", hot=False):
+    """سطر بداية البوست: بيتنوع بين الصياغات (خصم بالنسبة / عرض ممتاز على / توفير حقيقي / عروض اليوم...)."""
+    name = short_name(title)
+    pool = [
+        "🛍️ من عروض اليوم",
+        "👀 شوف العرض ده",
+        "⏳ الحق العرض ده قبل ما يخلص",
+        "✅ متاح حاليًا",
+        "🔥 متفوتش العرض ده",
+    ]
+    if pct and pct >= 5:
+        pool += [f"🔥 عرض بخصم {pct}%", f"💰 عرض توفير حقيقي — خصم {pct}%", f"🏷️ خصم {pct}% دلوقتي"]
+        if pct >= 50 or hot:
+            pool += [f"🚨 عرض ممتاز — خصم {pct}%", "⏳ الحق العرض ده قبل ما يخلص"]
+    if name and pct and pct >= 20:
+        pool += [f"⭐ عرض ممتاز على {name}", f"💥 عرض توفير حقيقي على {name}"]
+    return random.choice(pool)
+
+
 CLOSERS = [
     "⏳ الكمية والسعر ممكن يتغيروا في أي وقت.",
     "👌 اطلبه قبل ما يخلص.",
@@ -275,6 +302,52 @@ def clean_title(t):
     return re.sub(r"\s+", " ", t).strip(" :：|-–")
 
 
+# أقسام الصفحة اللي فيها أسعار منتجات تانية (مقترحات/إعلانات) ومينفعش نقرا منها سعر المنتج
+_BAD_SECTIONS = ("sims", "similar", "sp_detail", "sponsored", "anonCarousel", "bundle", "percolate", "rhf",
+                 "recently", "customer-reviews", "a-carousel")
+_PRICE_ROOTS = (
+    "#corePriceDisplay_desktop_feature_div", "#corePrice_feature_div", "#apex_desktop",
+    "#apex_offerDisplay_desktop", "#desktop_buybox", "#buybox", "#qualifiedBuybox", "#tabular-buybox",
+    "#centerCol", "#ppd",
+)
+
+
+def _price_roots(soup):
+    for sel in _PRICE_ROOTS:
+        root = soup.select_one(sel)
+        if root is not None:
+            yield root
+
+
+def _bad_section(el, root):
+    for a in el.parents:
+        if a is root:
+            break
+        ident = " ".join(filter(None, [a.get("id", ""), " ".join(a.get("class", []) or [])])).lower()
+        if ident and any(b.lower() in ident for b in _BAD_SECTIONS):
+            return True
+    return False
+
+
+def scoped_price(soup, strike):
+    """سعر المنتج الأساسي (strike=False) أو سعر القائمة المشطوب (strike=True) من صندوق الشراء بس."""
+    for root in _price_roots(soup):
+        if strike:
+            els = root.select("span.a-price.a-text-price, span[data-a-strike='true'], .basisPrice .a-price")
+        else:
+            els = root.select(".a-price:not(.a-text-price)")
+        for el in els:
+            if _bad_section(el, root):
+                continue
+            if not strike and el.get("data-a-strike") == "true":
+                continue
+            off = el.select_one(".a-offscreen")
+            v = parse_price(off.get_text(" ", strip=True)) if off else None
+            if v:
+                return v
+    return None
+
+
 def read_product(page):
     soup = BeautifulSoup(page, "html.parser")
 
@@ -287,31 +360,21 @@ def read_product(page):
         title = soup.title.string
     title = clean_title(title)
 
-    price_txt = first_text(
-        soup,
-        [
-            "#corePriceDisplay_desktop_feature_div .a-price:not(.a-text-price) .a-offscreen",
-            "#corePrice_feature_div .a-price:not(.a-text-price) .a-offscreen",
-            "#apex_desktop .a-price:not(.a-text-price) .a-offscreen",
-            ".priceToPay .a-offscreen",
-            "span.a-price:not(.a-text-price) .a-offscreen",
-            "#priceblock_ourprice",
-            "#priceblock_dealprice",
-            "#price_inside_buybox",
-        ],
-    )
-    price = parse_price(price_txt)
+    price = scoped_price(soup, strike=False)
+    if not price:
+        price = parse_price(first_text(soup, ["#priceblock_ourprice", "#priceblock_dealprice", "#price_inside_buybox"]))
 
-    old_txt = first_text(
-        soup,
-        [
-            "span.a-price.a-text-price .a-offscreen",
-            "span[data-a-strike='true'] .a-offscreen",
-            "#listPrice",
-            ".basisPrice .a-offscreen",
-        ],
-    )
-    old = parse_price(old_txt)
+    old = scoped_price(soup, strike=True)
+    if not old:
+        old = parse_price(first_text(soup, ["#listPrice"]))
+    if price and not old:
+        # أمازون كاتبة نسبة الخصم بس: نحسب السعر القديم منها
+        for root in _price_roots(soup):
+            el = root.select_one(".savingPercentage, .savingsPercentage")
+            m = re.search(r"(\d{1,2})\s*%", (el.get_text(" ") if el else "").translate(AR_DIGITS))
+            if m and 3 <= int(m.group(1)) <= 90:
+                old = round(price / (1 - int(m.group(1)) / 100), 2)
+                break
     if price and old and old <= price:
         old = None
 
@@ -419,15 +482,19 @@ COMPACT_POST = False
 
 
 def product_card(title, price, old, raw, extra=None):
-    """كارت العرض لو فيه خصم، وإلا None. extra: rating / reviews / coupon (اختياري)."""
-    if not raw or not (price and old and old > price):
+    """كارت المنتج: اسم + سعر (+ خصم وسعر قديم وكوبون لو موجودين). None لو مفيش صورة أو سعر."""
+    if not raw or not price or not title:
         return None
     try:
-        pct = int(round((old - price) / old * 100))
-        if pct < 1:
-            return None
         import deal_card
+        pct = 0
+        if old and old > price:
+            pct = int(round((old - price) / old * 100))
+        if pct < 1:
+            pct, old = 0, None
         item = {"title": title, "price": price, "old": old, "pct": pct}
+        if not pct:
+            item["badge"] = "متاح حاليًا"
         item.update({k: v for k, v in (extra or {}).items() if v})
         return deal_card.make_card(item, raw)
     except Exception as e:
@@ -450,14 +517,14 @@ def short_title(t, limit=95):
 
 
 def build_post(title, price, old, rating, link, compact=False):
-    if compact and price and old and old > price:
+    pct = round((old - price) / old * 100) if (price and old and old > price) else None
+    if compact and pct:
         # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
-        pct = round((old - price) / old * 100)
         return "\n".join([
-            f"🔥 خصم {pct}% — {fmt(price)} بدل {fmt(old)}",
+            opener(pct, title) + f" — {fmt(price)} بدل {fmt(old)}",
             "", "🛒 اشتري من هنا:", link, "",
         ] + FOOTER_LINES)
-    lines = [random.choice(OPENERS), "", f"<b>{html.escape(short_title(title))}</b>", ""]
+    lines = [opener(pct, title), "", f"<b>{html.escape(short_title(title))}</b>", ""]
     if price:
         lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
         if old:
@@ -545,7 +612,8 @@ def process_link(url):
     card = product_card(title, price, old, raw, {"rating": rating, "coupon": coupon})
     image = card or (prepare_image(raw) if raw else None)
     post = build_post(title, price, old, rating, link, compact=COMPACT_POST and bool(card))
-    return True, {"image": image, "post": post, "price": price}
+    return True, {"image": image, "post": post, "price": price, "title": title, "old": old, "rating": rating,
+                  "link": link, "asin": asin, "host": host}
 
 
 # ---------------------------------------------------------------- handlers
@@ -555,7 +623,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"رقمك (ID): {user.id}\nحطه في OWNER_ID وشغل البوت تاني.")
         return
     if is_allowed(user.id):
-        await update.message.reply_text("أهلاً! ابعتلي لينك منتج من أمازون وأنا أجهزلك البوست 🛒")
+        await update.message.reply_text("أهلاً! ابعتلي لينك منتج من أمازون وأنا أجهزلك البوست 🛒\n📸 أو ابعت لقطة شاشة للمنتج ومعاها اللينك، وأنا أحط عليها مستطيلات السعر والكوبونات وشريط القناة.")
         return
     await update.message.reply_text("طلبك اتبعت للمسؤول، استنى الموافقة ✋")
     kb = InlineKeyboardMarkup(
@@ -617,6 +685,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_post(context.bot, update.effective_chat.id, item["image"], post, make_kb(pid))
         return
     m = re.search(r"https?://\S+", update.message.text or "")
+    pend = context.bot_data.setdefault("pending_shot", {})
+    if m and user.id in pend:
+        raw = pend.pop(user.id)
+        await _finish_shot(update, context, raw, m.group(0).rstrip(").,"))
+        return
     if not m:
         await update.message.reply_text("ابعتلي لينك المنتج من أمازون 🔗")
         return
@@ -636,6 +709,81 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pid = new_pid()
     store_draft(pid, user.id, res["image"], res["post"])
     await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
+
+
+def _pct_of(price, old):
+    if price and old and old > price:
+        return int(round((old - price) / old * 100))
+    return None
+
+
+def _make_shot_draft(raw, url):
+    """Blocking. لقطة الشاشة + لينك المنتج -> (صورة، بوست). لو صفحة المنتج مقرتش بيطلع بوست بسيط باللينك والفوتر."""
+    import shot_card
+    ok, res = process_link(url)
+    if ok:
+        price, old = res["price"], res["old"]
+        img, info = shot_card.make_shot(raw, price=price, pct=_pct_of(price, old))
+        post = build_post(res["title"], price, old, res["rating"], res["link"], compact=bool(_pct_of(price, old)))
+        return True, {"image": img, "post": post, "info": info}
+    asin = find_asin(url)
+    if not asin:
+        return False, res
+    host = urlparse(url).netloc.lower()
+    host = host if ("amazon." in host and not host.startswith("link.")) else "www.amazon.eg"
+    img, info = shot_card.make_shot(raw)
+    post = "\n".join([opener(None, ""), "", "🛒 اشتري من هنا:", affiliate(host, asin), ""] + FOOTER_LINES)
+    return True, {"image": img, "post": post, "info": info}
+
+
+async def _finish_shot(update, context, raw, url):
+    user = update.effective_user
+    wait = await update.effective_message.reply_text("⏳ بجهز اللقطة...")
+    try:
+        ok, res = await asyncio.to_thread(_make_shot_draft, raw, url)
+    except Exception as e:
+        log.exception("shot failed")
+        ok, res = False, f"حصل خطأ غير متوقع: {type(e).__name__}"
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    if not ok:
+        await update.effective_message.reply_text("❌ " + str(res))
+        return
+    pid = new_pid()
+    store_draft(pid, user.id, res["image"], res["post"])
+    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
+    info = res["info"]
+    if not info.get("price") and not info.get("coupons"):
+        await update.effective_message.reply_text(
+            "ℹ️ مقدرتش أحدد مكان السعر والكوبونات في اللقطة فنزلت من غير مستطيلات "
+            "(لو مش مثبّت tesseract على Termux اكتب: pkg install tesseract)."
+        )
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لقطة شاشة لصفحة المنتج: لو مكتوب معاها لينك بيجهّز المسودة، وإلا بيستنى اللينك."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not is_allowed(user.id):
+        await msg.reply_text("مش مسموحلك تستخدم البوت. ابعت /start عشان تطلب الإذن.")
+        return
+    try:
+        if msg.photo:
+            f = await msg.photo[-1].get_file()
+        else:
+            f = await msg.document.get_file()
+        raw = bytes(await f.download_as_bytearray())
+    except Exception as e:
+        await msg.reply_text(f"معرفتش أنزّل الصورة: {type(e).__name__}")
+        return
+    m = re.search(r"https?://\S+", msg.caption or "")
+    if m:
+        await _finish_shot(update, context, raw, m.group(0).rstrip(").,"))
+        return
+    context.bot_data.setdefault("pending_shot", {})[user.id] = raw
+    await msg.reply_text("📸 استلمت اللقطة. ابعتلي دلوقتي لينك المنتج من أمازون.")
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -709,11 +857,20 @@ def main():
         print("POST_BOT_TOKEN مش موجود. اعمل export الأول.")
         return
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)
+        .connect_timeout(20)
+        .read_timeout(40)
+        .write_timeout(60)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     print("Bot is running...")
