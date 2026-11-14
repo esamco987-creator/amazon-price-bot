@@ -25,7 +25,7 @@ PRICE_FILL = (255, 214, 0, 70)  # أصفر شفاف
 COUPON_LINE = (22, 150, 70)     # أخضر
 COUPON_FILL = (60, 200, 90, 55)
 CODE_RE = re.compile(r"^[A-Z][A-Z0-9]*\d{2,}$")
-BANNER_H = 150
+BANNER_H_RATIO = 100 / 1200.0   # ارتفاع الشريط نسبة للعرض (زي كروت العروض)
 
 
 def _ocr_words(img):
@@ -92,7 +92,7 @@ def find_price_box_by_pct(words, price, pct, top_limit):
     return [x0, a["tp"] - 0.4 * h, a["l"] + a["w"] + 8, a["tp"] + 2.7 * h]
 
 
-def find_price_box_by_color(im, price, top_limit):
+def price_candidates_by_color(im, price, top_limit):
     """آخر حل: نسبة الخصم "-17%" مكتوبة بالأحمر (كلام رفيع مش مربع متملي). بنلاقيها من لونها ونحسب مكان السعر على يسارها."""
     from PIL import ImageChops
     r, g, b = im.split()
@@ -102,6 +102,7 @@ def find_price_box_by_color(im, price, top_limit):
                             ImageChops.subtract(r, b).point(lambda x: 255 if x > 30 else 0))
     raw, W = m.tobytes(), im.width
     start = None
+    out = []
     for y in range(int(top_limit), im.height + 1):
         on = y < im.height and raw[y * W:(y + 1) * W].count(255) >= 3
         if on and start is None:
@@ -139,21 +140,51 @@ def find_price_box_by_color(im, price, top_limit):
                 n = len(f"{int(price):,}") if price else 4
                 tt = t + bb[1]
                 x0 = gx0 - (n * 0.62 * 1.15 * th + 3.6 * th + 8)   # الأرقام + الكسور الصغيرة + كلمة جنيه
-                return [x0, tt - 0.4 * th, gx1 + 8, tt + 2.7 * th]
-    return None
+                out.append([x0, tt - 0.4 * th, gx1 + 8, tt + 2.7 * th])
+    return out
+
+
+def _crop_has_price(im, box, price):
+    """نقص مستطيل السعر ونقراه تاني بتكبير كبير: لو فيه أرقام السعر يبقى هو."""
+    exe = shutil.which("tesseract")
+    if not exe or not price:
+        return False
+    x0, y0, x1, y1 = [int(v) for v in _clamp(box, im)]
+    if x1 - x0 < 20 or y1 - y0 < 10:
+        return False
+    crop = im.crop((x0, y0, x1, y1))
+    crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
+    want = str(int(price))
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "c.png")
+        crop.save(p)
+        for psm in ("6", "7"):
+            try:
+                r = subprocess.run([exe, p, "stdout", "-l", "eng", "--psm", psm], capture_output=True, text=True, timeout=30)
+            except Exception:
+                return False
+            if want in re.sub(r"\D", "", r.stdout):
+                return True
+    return False
 
 
 def find_price_box(words, price, pct=None, top_limit=0, im=None):
-    """مستطيل حوالين السعر (+ نسبة الخصم على نفس السطر + سطر سعر القائمة تحته)."""
+    """مستطيل حوالين السعر. بنجرّب أكتر من طريقة، وأي مستطيل مش مؤكد بنتأكد منه بقراءة المنطقة تاني؛ ولو مفيش مؤكد مفيش مستطيل."""
     if not price:
         return None
     box = _find_price_box_digits(words, price)
     if box:
         return box
-    box = find_price_box_by_pct(words, price, pct, top_limit)
-    if box:
-        return box
-    return find_price_box_by_color(im, price, top_limit) if im is not None else None
+    cands = []
+    b = find_price_box_by_pct(words, price, pct, top_limit)
+    if b:
+        cands.append(b)
+    if im is not None:
+        cands += price_candidates_by_color(im, price, top_limit)[:6]
+    for b in cands:
+        if im is None or _crop_has_price(im, b, price):
+            return b
+    return None
 
 
 def _find_price_box_digits(words, price):
@@ -254,35 +285,29 @@ def _clamp(box, im):
 
 
 def _banner(card, bh):
-    """شريط القناة: لوجو كبير + اسم القناة + اللينك."""
+    """شريط القناة بنفس شكل كروت العروض (نسبة للعرض): لوجو + اسم القناة + اللينك."""
     W, H = card.size
+    k = W / 1200.0
     d = ImageDraw.Draw(card)
     d.rectangle([0, H - bh, W, H], fill=dc.NAVY)
-    R = 58
-    cy = H - bh // 2
-    right = W - 34
-    cx = right - R
-    d.ellipse([cx - R - 6, cy - R - 6, cx + R + 6, cy + R + 6], fill=dc.YELLOW)
-    d.ellipse([cx - R, cy - R, cx + R, cy + R], fill=dc.WHITE)
+    right = W - int(40 * k)
+    mid = H - bh // 2
     if os.path.exists(dc.LOGO_FILE):
         try:
             lg = Image.open(dc.LOGO_FILE).convert("RGBA")
-            lg.thumbnail((2 * R - 6, 2 * R - 6), Image.LANCZOS)
-            card.paste(lg, (cx - lg.width // 2, cy - lg.height // 2), lg)
+            dia = int(80 * k)
+            lg.thumbnail((dia - int(6 * k), dia - int(6 * k)), Image.LANCZOS)
+            d.ellipse([right - dia, mid - dia // 2, right, mid + dia // 2], fill=dc.WHITE)
+            card.paste(lg, (right - dia + (dia - lg.width) // 2, mid - lg.height // 2), lg)
+            right -= dia + int(18 * k)
         except Exception:
             pass
-    right = cx - R - 22
-    bf = dc.font(38)
-    bw = int(dc.width(d, dc.BRAND, bf)) + 48
-    d.rounded_rectangle([right - bw, cy - 36, right, cy + 36], radius=16, fill=dc.YELLOW)
-    dc.draw_text(d, (right - bw // 2, cy), dc.BRAND, bf, dc.NAVY, "mm")
-    size = 30
-    lf = dc.font(size)
-    room = (right - bw) - 34 - 20
-    while d.textlength(dc.LINK, font=lf) > room and size > 14:
-        size -= 2
-        lf = dc.font(size)
-    d.text((34, cy), dc.LINK, font=lf, fill=dc.WHITE, anchor="lm")
+    bf = dc.font(max(14, int(42 * k)))
+    bw = int(dc.width(d, dc.BRAND, bf)) + int(56 * k)
+    ph = int(68 * k)
+    d.rounded_rectangle([right - bw, mid - ph // 2, right, mid + ph // 2], radius=int(18 * k), fill=dc.YELLOW)
+    dc.draw_text(d, (right - bw // 2, mid), dc.BRAND, bf, dc.NAVY, "mm")
+    d.text((int(40 * k), mid), dc.LINK, font=dc.font(max(12, int(34 * k))), fill=dc.WHITE, anchor="lm")
 
 
 def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
@@ -316,9 +341,10 @@ def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
     except Exception as e:
         log.warning("marking failed: %s", type(e).__name__)
 
-    card = Image.new("RGB", (im.width, im.height + BANNER_H), (255, 255, 255))
+    bh = max(60, int(im.width * BANNER_H_RATIO))
+    card = Image.new("RGB", (im.width, im.height + bh), (255, 255, 255))
     card.paste(im, (0, 0))
-    _banner(card, BANNER_H)
+    _banner(card, bh)
     out = io.BytesIO()
     card.save(out, "JPEG", quality=92)
     return out.getvalue(), info
