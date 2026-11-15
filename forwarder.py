@@ -26,7 +26,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 
-SOURCES = ["arkhashomoffers", "OffersEgyptofficial", "Mego_Reviews", "ba3bou3_deals", "deals_me"]
+SOURCES = ["OffersEgyptofficial", "Mego_Reviews", "ba3bou3_deals", "Raw5aa"]
 PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
 FOOTER = (
@@ -54,6 +54,8 @@ BAD_URL_PARTS = [
     "t.me", "wa.me", "whatsapp.com", "facebook.com", "fb.com",
     "instagram.com", "tiktok.com", "youtube.com", "youtu.be",
 ]
+
+BLOCKED_SHORT = ["3rrood.com"]
 
 seen = set()
 target_box = {}
@@ -356,6 +358,11 @@ async def main():
         for u in urls:
             new_urls.append(await asyncio.to_thread(to_my_link, u))
         lines = [replace_all(l, urls, new_urls) for l in lines]
+
+        # روابط مختصرة بكود تسويق صاحب القناة (مش بتتحوّل للينكك): نتجاهل البوست كله
+        if any(d in u.lower() for u in new_urls for d in BLOCKED_SHORT):
+            logging.info("skipped post with foreign short link")
+            return
 
         uniq = list(dict.fromkeys(new_urls))
         post = build_post(lines, uniq)
