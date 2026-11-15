@@ -26,7 +26,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 
-SOURCES = ["arkhashomoffers", "OffersEgyptofficial", "Raw5aa"]
+SOURCES = ["arkhashomoffers", "OffersEgyptofficial", "Mego_Reviews"]
 PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
 FOOTER = (
