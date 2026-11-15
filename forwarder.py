@@ -111,6 +111,22 @@ def is_product_url(url):
 def to_my_link(url):
     """يحوّل لينك أمازون للينك بكودك. أي لينك تاني بيرجع زي ما هو."""
     if not AMAZON_RE.search(url):
+        # لينك مختصر (زي 3rrood.com): نفتحه، ولو وصل لأمازون نحوّله للينكك
+        try:
+            f2, b2 = None, ""
+            for hs in pb.HEADER_STRATEGIES[:2]:
+                f2, b2 = pb.resolve(url, hs)
+                if AMAZON_RE.search(urlparse(f2).netloc or ""):
+                    break
+                m = re.search(r"https?://(?:www\.)?amazon\.eg/[^\s\"'<>\\]+", b2.replace("\\/", "/"))
+                if m:
+                    f2 = m.group(0)
+                    break
+            if f2 and AMAZON_RE.search(urlparse(f2).netloc or ""):
+                logging.info("short link resolved to amazon: %s", urlparse(url).netloc)
+                return to_my_link(f2)
+        except Exception as e:
+            logging.warning("short link resolve failed: %s", type(e).__name__)
         return url
     try:
         final, body = pb.resolve(url, pb.HEADER_STRATEGIES[0])
