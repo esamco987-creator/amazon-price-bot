@@ -228,7 +228,21 @@ def fix_url(u):
     return "https:" + u if u.startswith("//") else u
 
 
-def load_promo(url):
+def load_promo(url, tries=4):
+    """بيحاول كذا مرة: أمازون أحيانًا بيرجّع صفحة ناقصة (من غير csrf) وبتنجح في المحاولة اللي بعدها."""
+    info = None
+    for i in range(tries):
+        info = _load_promo_once(url)
+        if info and info.get("products"):
+            return info
+        if i < tries - 1:
+            time.sleep(2 + i * 2)
+    if info is not None:
+        note(f"promo gave no products after {tries} tries")
+    return info
+
+
+def _load_promo_once(url):
     """يفتح صفحة العرض ويجيب منتجاتها من نفس الطلب اللي الصفحة بتستخدمه.
     يرجع dict: final, title, dates, products=[{asin,title,price,old,image}] أو None."""
     import requests as rq
