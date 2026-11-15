@@ -253,16 +253,30 @@ def _load_promo_once(url):
         note(f"resolve failed: {type(e).__name__}")
         return None
     sess = rq.Session()
+    orig_final = final
     pid0 = promo_id(final)
-    if pid0:
-        final = f"https://{HOST}/-/ar/promotion/psp/{pid0}"  # النسخة العربية
-    hdr = dict(pb.HEADER_STRATEGIES[1])
-    hdr["Accept-Language"] = "ar-EG,ar;q=0.9,en;q=0.8"
-    try:
-        r = sess.get(final, headers=hdr, timeout=30)
-        body = r.text or ""
-    except Exception as e:
-        note(f"page get failed: {type(e).__name__}")
+    ar_final = f"https://{HOST}/-/ar/promotion/psp/{pid0}" if pid0 else final
+    # بنجرّب كذا شكل لنفس الصفحة (عربي/عادي + هيدرز مختلفة) لحد ما نلاقي النسخة اللي فيها مفتاح الأمان
+    combos = [(ar_final, 1), (orig_final, 1), (ar_final, 0), (orig_final, 0), (orig_final, 2)]
+    r, body, final, hdr = None, "", ar_final, dict(pb.HEADER_STRATEGIES[1])
+    for k, (u, hi) in enumerate(combos):
+        h = dict(pb.HEADER_STRATEGIES[hi])
+        h["Accept-Language"] = "ar-EG,ar;q=0.9,en;q=0.8"
+        try:
+            r_try = sess.get(u, headers=h, timeout=30)
+        except Exception as e:
+            note(f"page get failed: {type(e).__name__}")
+            continue
+        b = r_try.text or ""
+        has = bool(re.search(r"""anti-csrftoken-a2z["']\s*:\s*["']([^"']+)""", b))
+        if not has:
+            low = b.lower()
+            note(f"combo {k} no csrf: status={r_try.status_code} len={len(b)} captcha={'captcha' in low or 'robot' in low}")
+        if r is None or has:
+            r, body, final, hdr = r_try, b, u, h
+        if has:
+            break
+    if r is None:
         return None
     host = urlparse(r.url).netloc or HOST
     pid = promo_id(r.url) or promo_id(final)
