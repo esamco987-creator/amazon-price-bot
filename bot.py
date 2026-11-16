@@ -5,16 +5,21 @@ import time
 import asyncio
 import logging
 import threading
+from collections import Counter
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup as Kb
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters,
+)
 
 import post_bot as pb  # نفس دوال قراءة أمازون الشغالة في بوت البوستات
+import price_history as ph  # تاريخ الأسعار + الإحصائيات + الرسم البياني
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 for _n in ("httpx", "httpcore", "telegram", "apscheduler", "urllib3"):
@@ -25,6 +30,15 @@ TOKEN = os.environ.get("BOT_TOKEN", "")
 CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "1800"))  # كل نص ساعة
 AFFILIATE_TAG = "mixdeals-21"  # اللينك في التنبيه بيبقى بكودك. امسحه لو مش عايز: ""
 MAX_ITEMS = 25  # أقصى عدد منتجات لكل شخص
+FETCH_PARALLEL = 4  # عدد المنتجات اللي بتتفحص في نفس الوقت
+
+# قناتك: البوت بيطلب من المستخدم الجديد يشترك فيها (لازم البوت يكون أدمن في القناة عشان يقدر يتأكد)
+REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "@PromoCodeOnlain")
+CHANNEL_URL = "https://t.me/" + REQUIRED_CHANNEL.lstrip("@") if REQUIRED_CHANNEL else ""
+try:
+    OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)
+except ValueError:
+    OWNER_ID = 0
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE, "tracked.json")
@@ -54,7 +68,8 @@ def save():
         log.warning("save failed: %s", type(e).__name__)
 
 
-tracked = load()  # {chat_id: [ {asin, host, title, target, last, lowest, notified}, ... ]}
+# {chat_id: [ {asin, host, title, target, last, lowest, notified, old, image, coupon, avail, miss}, ... ]}
+tracked = load()
 
 
 # ---------------------------------------------------------------- amazon
@@ -93,6 +108,13 @@ PRICE_ROOTS = (
     "#centerCol",   # احتياطي: العمود الرئيسي للمنتج (الأقسام المقترحة بتتفلتر برضه)
     "#ppd",
 )
+# الصفحة بتبقى حوالي 600 ألف حرف وأغلبها تقييمات ومنتجات مقترحة. بنقصّها عند أول قسم منهم قبل التحليل (أسرع بكتير)
+CUT_MARKERS = (
+    'id="aplus"', 'id="customerReviews"', 'id="reviewsMedley"', 'id="similarities_feature_div"',
+    'id="sims-consolidated-1_feature_div"', 'id="productDescription_feature_div"',
+)
+MIN_CUT = 150000
+COUPON_HINTS = ("coupon", "Coupon", "قسيمة", "كوبون")
 
 
 def _sess():
@@ -117,7 +139,8 @@ def get_html(url, debug, tries=3):
         except Exception as e:
             last = type(e).__name__
         debug.append(f"محاولة {i + 1}: {last}")
-        time.sleep(1.5 * (i + 1))
+        if i < tries - 1:
+            time.sleep(0.8 * (i + 1))
     return None, ""
 
 
@@ -161,6 +184,79 @@ def page_asin(soup):
     return (pb.find_asin(link.get("href", "")) if link else None)
 
 
+def slim(page):
+    """يقص الصفحة عند أول قسم تقييمات/مقترحات (لو القص بعد أول 150 ألف حرف، عشان مانقصش حاجة مهمة)."""
+    cut = len(page)
+    for m in CUT_MARKERS:
+        i = page.find(m)
+        if MIN_CUT < i < cut:
+            cut = i
+    return page[:cut]
+
+
+def extract_coupon(page, asin):
+    if not any(h in page for h in COUPON_HINTS):
+        return None
+    try:
+        import deals_scanner as scanner  # نفس كاشف الكوبونات بتاع بوت العروض
+        return scanner.extract_coupon(page, asin)
+    except Exception as e:
+        log.warning("coupon read failed: %s", type(e).__name__)
+        return None
+
+
+def parse_product(page, asin):
+    """يرجع (حالة, بيانات). الحالة: ok / mismatch / notitle."""
+    soup = BeautifulSoup(page, "html.parser")
+    shown = page_asin(soup)
+    if shown and shown != asin.upper():
+        return "mismatch", None  # الصفحة اتحولت لمنتج/موديل تاني: مانثقش في سعرها
+    title, p2, old, rating, img = pb.read_product(page)
+    if not title:
+        return "notitle", None
+    price = read_price(soup)
+    if old and (not price or old <= price or (p2 and abs(p2 - price) / price > 0.01)):
+        old = None  # السعر القديم لازم يكون بتاع نفس السعر الحالي
+    return "ok", {"title": title, "price": price, "old": old, "rating": rating, "image": img}
+
+
+def fetch_by_asin(host, asin, debug):
+    """يرجع dict فيه asin/host/title/price/old/image/coupon. أو None لو الصفحة ماجتش."""
+    _, page = get_html(f"https://{host}/dp/{asin}", debug)
+    if not page:
+        return None
+    small = slim(page)
+    st, prod = parse_product(small, asin)
+    if small is not page and (st == "notitle" or (st == "ok" and prod["price"] is None)):
+        st, prod = parse_product(page, asin)  # القص مكانش مناسب للصفحة دي: نحلل الصفحة كلها
+        small = page
+    if st == "mismatch":
+        log.warning("asin mismatch for %s", asin)
+        debug.append("الصفحة بتعرض منتج مختلف")
+        return None
+    if st != "ok":
+        return None
+    prod.update({"asin": asin, "host": host, "coupon": extract_coupon(small, asin) if prod["price"] else None})
+    return prod
+
+
+_prod_cache = {}  # {(host, asin): (وقت, منتج)} — منتج اتقرا من دقيقتين ما نقراهوش تاني لما حد تاني يضيفه
+
+
+def get_product(host, asin, debug):
+    key = (host, asin)
+    hit = _prod_cache.get(key)
+    if hit and time.time() - hit[0] < 120 and hit[1]:
+        return hit[1]
+    prod = fetch_by_asin(host, asin, debug)
+    if prod:
+        _prod_cache[key] = (time.time(), prod)
+        if len(_prod_cache) > 200:
+            for k in sorted(_prod_cache, key=lambda k: _prod_cache[k][0])[:100]:
+                _prod_cache.pop(k, None)
+    return prod
+
+
 def fetch_product(url, debug):
     """يرجع dict فيه asin/host/title/price أو None."""
     host = urlparse(url).netloc.lower()
@@ -179,119 +275,286 @@ def fetch_product(url, debug):
         return None
     if "amazon." not in host or host.startswith("link."):
         host = "www.amazon.eg"
-    return fetch_by_asin(host, asin, debug)
+    return get_product(host, asin, debug)
 
 
-def fetch_by_asin(host, asin, debug):
-    _, page = get_html(f"https://{host}/dp/{asin}", debug)
-    if not page:
+# ---------------------------------------------------------------- telegram helpers
+_img_cache = {}  # {رابط الصورة: بايتات}
+
+
+def get_image(url):
+    if not url:
         return None
-    soup = BeautifulSoup(page, "html.parser")
-    shown = page_asin(soup)
-    if shown and shown != asin.upper():
-        # الصفحة اتحولت لمنتج/موديل تاني: مانثقش في سعرها
-        log.warning("asin mismatch: wanted %s page shows %s", asin, shown)
-        debug.append("الصفحة بتعرض منتج مختلف")
-        return None
-    title, _, _, _, _ = pb.read_product(page)
-    if not title:
-        return None
-    return {"asin": asin, "host": host, "title": title, "price": read_price(soup)}
+    if url in _img_cache:
+        return _img_cache[url]
+    try:
+        raw = pb.download_image(url)
+    except Exception:
+        raw = None
+    if raw:
+        if len(_img_cache) > 60:
+            _img_cache.pop(next(iter(_img_cache)), None)
+        _img_cache[url] = raw
+    return raw
+
+
+async def safe_answer(q, text=None, alert=False):
+    try:
+        await q.answer(text, show_alert=alert)
+    except Exception:
+        pass  # الضغطة قديمة أو النت واقع
+
+
+async def send_card(bot, chat, p, text, kb):
+    """بيبعت صورة المنتج + النص + الأزرار (ولو مفيش صورة، نص بس)."""
+    raw = await asyncio.to_thread(get_image, p.get("image"))
+    if raw:
+        try:
+            return await bot.send_photo(int(chat), raw, caption=text[:1000], reply_markup=kb)
+        except Exception as e:
+            log.warning("send photo failed: %s", type(e).__name__)
+    return await bot.send_message(int(chat), text[:4000], reply_markup=kb)
+
+
+def find_item(chat, asin):
+    for p in tracked.get(str(chat), []):
+        if p["asin"] == asin:
+            return p
+    return None
+
+
+# ---------------------------------------------------------------- الاشتراك في القناة
+_member_cache = {}
+_warned = {"member": False}
+
+
+async def is_member(bot, uid, force=False):
+    """هل المستخدم مشترك في القناة؟ لو البوت مش أدمن فيها (مايقدرش يتأكد) بنسمح بدل ما نوقّف البوت."""
+    if not REQUIRED_CHANNEL or uid == OWNER_ID:
+        return True
+    hit = _member_cache.get(uid)
+    if hit and hit[1] and not force and time.time() - hit[0] < 600:
+        return True
+    try:
+        m = await bot.get_chat_member(REQUIRED_CHANNEL, uid)
+        ok = m.status in ("member", "administrator", "creator") or (m.status == "restricted" and getattr(m, "is_member", True))
+        _member_cache[uid] = (time.time(), ok)
+        return ok
+    except Exception as e:
+        if not _warned["member"]:
+            _warned["member"] = True
+            log.warning("membership check failed (%s). خلي البوت أدمن في القناة عشان شرط الاشتراك يشتغل", type(e).__name__)
+        return True
+
+
+def gate_kb():
+    rows = []
+    if CHANNEL_URL:
+        rows.append([Btn("📢 اشترك في القناة", url=CHANNEL_URL)])
+    rows.append([Btn("✅ اشتركت، كمّل", callback_data="sub")])
+    return Kb(rows)
+
+
+# ---------------------------------------------------------------- نصوص وأزرار الكارت
+def target_text(p):
+    t = p.get("target")
+    if t:
+        return f"هنبلغك لما السعر ينزل لـ {pb.fmt(t)} أو أقل"
+    return "هنبلغك مع أي نزول في السعر"
+
+
+def card_text(p):
+    price = p["last"]
+    lines = [f"🛒 {p['title'][:90]}", ""]
+    price_line = f"💰 السعر: {pb.fmt(price)}"
+    old = p.get("old")
+    if old and old > price:
+        price_line += f"  (كان {pb.fmt(old)} — خصم {round((old - price) / old * 100)}%)"
+    lines.append(price_line)
+    if p.get("coupon"):
+        lines.append(f"🎟️ كوبون: {p['coupon']}")
+    if p.get("avail", True) is False:
+        lines.append("📦 المنتج مش متوفر دلوقتي")
+    _, vtxt = ph.verdict(p["asin"], price)
+    lines += ["", vtxt]
+    st = ph.stats(p["asin"])
+    if st and st["n"] >= 2:
+        lines.append(f"📉 أقل سعر سجلته: {pb.fmt(st['min'])} | الأعلى: {pb.fmt(st['max'])}")
+    lines += ["", "🔔 " + target_text(p)]
+    return "\n".join(lines)
+
+
+def card_kb(p):
+    a = p["asin"]
+    return Kb([
+        [Btn("📉 نزول 10%", callback_data=f"t:{a}:10"), Btn("📉 نزول 20%", callback_data=f"t:{a}:20"),
+         Btn("📉 نزول 30%", callback_data=f"t:{a}:30")],
+        [Btn("⭐ لأقل سعر", callback_data=f"t:{a}:low"), Btn("🔔 أي نزول", callback_data=f"t:{a}:any")],
+        [Btn("📈 رسم السعر", callback_data=f"c:{a}"), Btn("🛒 اشتري من أمازون", url=link_for(p))],
+        [Btn("🛑 وقف المتابعة", callback_data=f"x:{a}")],
+    ])
+
+
+def alert_kb(p):
+    a = p["asin"]
+    return Kb([
+        [Btn("🛒 اشتري الآن", url=link_for(p)), Btn("📈 رسم السعر", callback_data=f"c:{a}")],
+        [Btn("🛑 وقف المتابعة", callback_data=f"x:{a}")],
+    ])
+
+
+async def refresh_card(q, p):
+    """يحدّث نص الكارت بعد تغيير التنبيه."""
+    text, kb = card_text(p), card_kb(p)
+    try:
+        if q.message and q.message.photo:
+            await q.edit_message_caption(caption=text[:1000], reply_markup=kb)
+        else:
+            await q.edit_message_text(text[:4000], reply_markup=kb)
+    except BadRequest:
+        pass  # نفس النص
+    except Exception as e:
+        log.warning("refresh card failed: %s", type(e).__name__)
 
 
 # ---------------------------------------------------------------- commands
 HELP = (
-    "أهلاً! أنا بوت تتبع أسعار أمازون 📉\n\n"
-    "ابعتلي رابط المنتج وبعده السعر المطلوب (من غير /track):\n"
-    "https://www.amazon.eg/dp/XXXX 1500\n"
-    "هبلغك لما السعر ينزل لـ 1500 أو أقل.\n\n"
-    "ولو بعت الرابط من غير سعر، هبلغك مع أي نزول في السعر.\n\n"
-    "/list — المنتجات اللي بتتابعها\n"
+    "أهلاً بيك في بوت تتبع أسعار أمازون مصر 📉\n\n"
+    "مش بس بتابعلك السعر، كمان بقولك تشتري دلوقتي ولا تستنى.\n\n"
+    "ابعتلي رابط أي منتج من amazon.eg وهبدأ أتابعه، وبعدها اختار من الأزرار تحب أنبهك إمتى:\n"
+    "🔔 لما ينزل 10% أو 20% أو 30%\n"
+    "⭐ لما يوصل لأقل سعر سجلته\n"
+    "📈 وشوف رسم بياني لسعر المنتج\n\n"
+    "ولو عندك سعر معين، اكتبه بعد الرابط:\n"
+    "https://www.amazon.eg/dp/XXXX 1500\n\n"
+    "/list — قايمتي: المنتجات اللي بتتابعها\n"
     "/check — افحص الأسعار دلوقتي\n"
     "/remove رقم — احذف منتج"
 )
 
 
+def user_name(u):
+    return (u.full_name if u else "") or ""
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP)
+    u = update.effective_user
+    ph.touch_user(update.effective_chat.id, user_name(u), (u.username or "") if u else "")
+    kb = Kb([[Btn("📢 قناة عروض وخصومات", url=CHANNEL_URL)]]) if CHANNEL_URL else None
+    await update.message.reply_text(HELP, reply_markup=kb)
 
 
 async def track(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await do_track(update, " ".join(context.args))
+    await core_track(context.bot, update.effective_chat.id, update.effective_user, " ".join(context.args), context.user_data)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """رابط من غير /track."""
-    await do_track(update, update.message.text or "")
+    await core_track(context.bot, update.effective_chat.id, update.effective_user, update.message.text or "", context.user_data)
 
 
-async def do_track(update: Update, text):
-    m = URL_RE.search(text)
+async def core_track(bot, chat_id, user, text, user_data):
+    uid = user.id if user else chat_id
+    ph.touch_user(chat_id, user_name(user), (user.username or "") if user else "")
+    m = URL_RE.search(text or "")
     if not m:
-        await update.message.reply_text(
+        await bot.send_message(
+            chat_id,
             "ابعتلي رابط المنتج من أمازون، وممكن تكتب بعده السعر المطلوب.\n"
-            "مثال: https://www.amazon.eg/dp/XXXX 1500"
+            "مثال: https://www.amazon.eg/dp/XXXX 1500",
         )
         return
-    url = m.group(0).rstrip(").,")
-    target = num(URL_RE.sub("", text))
-
-    chat = str(update.effective_chat.id)
-    items = tracked.setdefault(chat, [])
-    if len(items) >= MAX_ITEMS:
-        await update.message.reply_text(f"وصلت للحد الأقصى ({MAX_ITEMS} منتج). احذف منتج الأول بـ /remove.")
+    if not await is_member(bot, uid):
+        user_data["pending"] = text
+        await bot.send_message(
+            chat_id,
+            "عشان تستخدم البوت لازم تكون مشترك في قناة عروض وخصومات 📢\n"
+            "اشترك الأول، وبعدين اضغط «✅ اشتركت، كمّل» وهكمّل متابعة المنتج.",
+            reply_markup=gate_kb(),
+        )
         return
 
-    await update.message.reply_text("ثواني، بقرا المنتج...")
+    url = m.group(0).rstrip(").,")
+    target = num(URL_RE.sub("", text))
+    chat = str(chat_id)
+    items = tracked.setdefault(chat, [])
+
+    wait = await bot.send_message(chat_id, "ثواني، بقرا المنتج...")
     debug = []
     prod = await asyncio.to_thread(fetch_product, url, debug)
+
+    async def clear_wait():
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+
     if not prod:
-        await update.message.reply_text(
-            "معرفتش أقرا المنتج من الرابط ده. اتأكد إنه رابط منتج من أمازون وجرب تاني.\n" + "\n".join(debug)
+        await clear_wait()
+        await bot.send_message(
+            chat_id,
+            "معرفتش أقرا المنتج من الرابط ده. اتأكد إنه رابط منتج من أمازون وجرب تاني.\n" + "\n".join(debug),
         )
         return
     if prod["price"] is None:
-        await update.message.reply_text(
-            f"{prod['title'][:80]}\nالمنتج ده مفيش له سعر دلوقتي (غالبًا مش متوفر). جرب لما يتوفر."
-        )
-        return
-    if any(p["asin"] == prod["asin"] and p["host"] == prod["host"] for p in items):
-        await update.message.reply_text("المنتج ده بتتابعه بالفعل.")
+        await clear_wait()
+        await bot.send_message(chat_id, f"{prod['title'][:80]}\nالمنتج ده مفيش له سعر دلوقتي (غالبًا مش متوفر). جرب لما يتوفر.")
         return
 
-    item = {
-        "asin": prod["asin"],
-        "host": prod["host"],
-        "title": prod["title"],
-        "target": target,
-        "last": prod["price"],
-        "lowest": prod["price"],
-        "notified": False,
-    }
+    ph.record(prod["asin"], prod["price"])
+    ph.log_search(chat_id, prod["asin"], prod["title"])
+
+    item = next((p for p in items if p["asin"] == prod["asin"] and p["host"] == prod["host"]), None)
+    if item is None:
+        if len(items) >= MAX_ITEMS:
+            await clear_wait()
+            await bot.send_message(chat_id, f"وصلت للحد الأقصى ({MAX_ITEMS} منتج). احذف منتج الأول من /list.")
+            return
+        item = {
+            "asin": prod["asin"], "host": prod["host"], "title": prod["title"], "target": target,
+            "last": prod["price"], "lowest": prod["price"], "notified": False,
+        }
+        with lock:
+            items.append(item)
+    elif target:
+        item["target"] = target
+        item["notified"] = False
+    item.update({
+        "title": prod["title"], "last": prod["price"], "old": prod.get("old"), "image": prod.get("image"),
+        "coupon": prod.get("coupon"), "avail": True, "miss": 0,
+    })
+    item["lowest"] = min(item.get("lowest", prod["price"]), prod["price"])
     with lock:
-        items.append(item)
         save()
-    when = f"لما ينزل لـ {pb.fmt(target)} أو أقل" if target else "مع أي نزول في السعر"
-    await update.message.reply_text(
-        f"تمام، بتابع:\n{prod['title'][:80]}\nالسعر دلوقتي: {pb.fmt(prod['price'])}\nهبلغك {when} ✅"
-    )
-    if target and prod["price"] <= target:
-        await update.message.reply_text("ملحوظة: السعر دلوقتي أقل من المطلوب أصلًا 👀\n" + link_for(item))
+
+    await clear_wait()
+    await send_card(bot, chat_id, item, card_text(item), card_kb(item))
+    if item.get("target") and prod["price"] <= item["target"]:
+        await bot.send_message(chat_id, "ملحوظة: السعر دلوقتي أقل من المطلوب أصلًا 👀", reply_markup=alert_kb(item))
+
+
+def list_view(chat):
+    items = tracked.get(str(chat), [])
+    if not items:
+        return "مفيش منتجات بتتابعها لسه. ابعتلي رابط منتج من أمازون وأبدأ أتابعه 📉", None
+    lines = ["📋 قايمتك", ""]
+    rows = []
+    for i, p in enumerate(items, 1):
+        want = pb.fmt(p["target"]) if p.get("target") else "أي نزول"
+        gone = " (مش متوفر)" if p.get("avail", True) is False else ""
+        lines.append(
+            f"{i}. {p['title'][:48]}{gone}\n"
+            f"   الحالي: {pb.fmt(p['last'])} | الأقل: {pb.fmt(p['lowest'])} | المطلوب: {want}"
+        )
+        rows.append([Btn(f"📊 تفاصيل {i}", callback_data=f"d:{p['asin']}"), Btn(f"🛑 حذف {i}", callback_data=f"x:{p['asin']}")])
+    rows.append([Btn("🔄 افحص الأسعار دلوقتي", callback_data="ck")])
+    return "\n\n".join([lines[0] + "\n"] + lines[2:])[:4000], Kb(rows)
 
 
 async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    items = tracked.get(str(update.effective_chat.id), [])
-    if not items:
-        await update.message.reply_text("مفيش منتجات بتتابعها.")
-        return
-    lines = []
-    for i, p in enumerate(items, 1):
-        want = pb.fmt(p["target"]) if p["target"] else "أي نزول"
-        lines.append(
-            f"{i}. {p['title'][:50]}\n"
-            f"   الحالي: {pb.fmt(p['last'])} | الأقل: {pb.fmt(p['lowest'])} | المطلوب: {want}"
-        )
-    await update.message.reply_text("\n\n".join(lines))
+    ph.touch_user(update.effective_chat.id, user_name(update.effective_user), (update.effective_user.username or ""))
+    text, kb = list_view(update.effective_chat.id)
+    await update.message.reply_text(text, reply_markup=kb)
 
 
 async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,7 +577,148 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("مفيش منتجات بتتابعها.")
         return
     await update.message.reply_text("بفحص الأسعار...")
-    await check_chat(context.bot, chat, always_report=True)
+    await check_all(context.bot, [chat], always_report=True)
+
+
+# ---------------------------------------------------------------- الأزرار
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    chat = str(q.message.chat_id) if q.message else str(q.from_user.id)
+    uid = q.from_user.id
+    bot = context.bot
+    parts = data.split(":")
+    act = parts[0]
+
+    if act == "sub":
+        if not await is_member(bot, uid, force=True):
+            await safe_answer(q, "لسه مش مشترك في القناة ❌ اشترك الأول وبعدين اضغط تاني", True)
+            return
+        await safe_answer(q, "تمام ✅")
+        pending = context.user_data.pop("pending", None)
+        if pending:
+            await core_track(bot, int(chat), q.from_user, pending, context.user_data)
+        else:
+            await bot.send_message(int(chat), "أهلاً بيك! ابعتلي رابط أي منتج من أمازون وأنا أتابعه 📉")
+        return
+
+    if act == "ck":
+        if not tracked.get(chat):
+            await safe_answer(q, "مفيش منتجات بتتابعها")
+            return
+        await safe_answer(q, "بفحص الأسعار... ثواني")
+        await check_all(bot, [chat], always_report=True)
+        return
+
+    p = find_item(chat, parts[1]) if len(parts) > 1 else None
+    if p is None:
+        await safe_answer(q, "المنتج ده اتحذف من قايمتك", True)
+        return
+
+    if act == "t" and len(parts) == 3:
+        mode = parts[2]
+        if mode in ("10", "20", "30"):
+            p["target"] = round(p["last"] * (1 - int(mode) / 100))
+            toast = f"تمام ✅ هنبلغك لما ينزل لـ {pb.fmt(p['target'])}"
+        elif mode == "low":
+            st = ph.stats(p["asin"])
+            lo = st["min"] if st else None
+            p["target"] = lo if lo and lo < p["last"] else round(p["last"] * 0.97)
+            toast = f"تمام ✅ هنبلغك لما ينزل لـ {pb.fmt(p['target'])}"
+        else:
+            p["target"] = None
+            toast = "تمام ✅ هنبلغك مع أي نزول في السعر"
+        p["notified"] = False
+        with lock:
+            save()
+        await safe_answer(q, toast)
+        await refresh_card(q, p)
+        return
+
+    if act == "c":
+        raw = await asyncio.to_thread(ph.chart, p["asin"], p["title"], p["last"])
+        if not raw:
+            await safe_answer(q, "لسه معنديش بيانات كفاية أرسمها. هسجّل السعر كل نص ساعة وهيبان بعد شوية 📊", True)
+            return
+        await safe_answer(q)
+        await bot.send_photo(int(chat), raw, caption=f"📈 {p['title'][:80]}")
+        return
+
+    if act == "d":
+        await safe_answer(q)
+        await send_card(bot, chat, p, card_text(p), card_kb(p))
+        return
+
+    if act == "x":
+        with lock:
+            tracked[chat] = [i for i in tracked.get(chat, []) if i["asin"] != p["asin"]]
+            save()
+        await safe_answer(q, "اتوقفت متابعة المنتج ده 🛑")
+        if q.message and (q.message.text or "").startswith("📋"):
+            text, kb = list_view(chat)
+            try:
+                await q.edit_message_text(text, reply_markup=kb)
+            except Exception:
+                pass
+        else:
+            try:
+                if q.message and q.message.photo:
+                    await q.edit_message_caption(caption=f"🛑 اتوقفت متابعة:\n{p['title'][:80]}")
+                else:
+                    await q.edit_message_text(f"🛑 اتوقفت متابعة:\n{p['title'][:80]}")
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- الإحصائيات (للمالك بس)
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if OWNER_ID == 0:
+        await update.message.reply_text(f"رقمك (ID): {uid}\nحطه في OWNER_ID (في ملف env.sh) وشغّل البوتات تاني.")
+        return
+    if uid != OWNER_ID:
+        return
+    s = await asyncio.to_thread(ph.summary)
+    if not s:
+        await update.message.reply_text("معرفتش أقرا الإحصائيات دلوقتي.")
+        return
+    members = None
+    if REQUIRED_CHANNEL:
+        try:
+            members = await context.bot.get_chat_member_count(REQUIRED_CHANNEL)
+        except Exception:
+            members = None
+
+    n_items = sum(len(v) for v in tracked.values())
+    n_users = sum(1 for v in tracked.values() if v)
+    cnt = Counter()
+    titles = {}
+    for lst in tracked.values():
+        for p in lst:
+            cnt[p["asin"]] += 1
+            titles[p["asin"]] = p["title"]
+
+    lines = ["📊 إحصائيات بوت التتبع", ""]
+    if members is not None:
+        lines.append(f"📢 مشتركين القناة: {members:,}")
+    lines += [
+        f"👥 مستخدمين البوت: {s['users']:,}",
+        f"   جداد النهارده: {s['users_today']} | آخر 7 أيام: {s['users_week']} | نشطين آخر 7 أيام: {s['active_week']}",
+        "",
+        f"🔎 منتجات اتبعتت للبحث/المتابعة: النهارده {s['searches_today']} | آخر 7 أيام {s['searches_week']}",
+        f"📌 منتجات متتبعة دلوقتي: {n_items} (عند {n_users} مستخدم)",
+        f"🔔 تنبيهات اتبعتت: النهارده {s['alerts_today']} | آخر 7 أيام {s['alerts_week']}",
+        f"📈 منتجات عندها تاريخ أسعار: {s['products_with_history']:,}",
+    ]
+    if s["top_searched"]:
+        lines += ["", "🔥 أكتر منتجات اتدوّر عليها (آخر 7 أيام):"]
+        for i, (asin, title, n, u) in enumerate(s["top_searched"], 1):
+            lines.append(f"{i}. {title[:50]} — {n} مرة ({u} شخص)")
+    if cnt:
+        lines += ["", "⭐ أكتر منتجات متتبعة دلوقتي:"]
+        for i, (asin, n) in enumerate(cnt.most_common(5), 1):
+            lines.append(f"{i}. {titles[asin][:50]} — {n} شخص")
+    await update.message.reply_text("\n".join(lines)[:4000])
 
 
 # ---------------------------------------------------------------- price checks
@@ -334,55 +738,97 @@ def decide(p, price):
     return notify
 
 
-async def check_chat(bot, chat, always_report=False):
-    items = tracked.get(chat, [])
-    sem = asyncio.Semaphore(3)  # 3 منتجات في نفس الوقت على الأكتر
+async def send_alert(bot, chat, p, kind, old, price):
+    title = p["title"][:80]
+    _, vtxt = ph.verdict(p["asin"], price)
+    if kind == "back":
+        text = f"📦 رجع متوفر!\n🛒 {title}\nالسعر دلوقتي: {pb.fmt(price)}"
+    elif kind == "coupon":
+        text = f"🎟️ ظهر كوبون على منتج بتتابعه!\n🛒 {title}\nالكوبون: {p.get('coupon')}\nالسعر دلوقتي: {pb.fmt(price)}"
+    else:
+        hit = p.get("target") and price <= p["target"]
+        head = "🎯 وصل للسعر اللي طلبته!" if hit else "📉 السعر نزل!"
+        drop = f" (نزل {round((old - price) / old * 100)}%)" if price < old else ""
+        text = f"{head}\n🛒 {title}\nكان: {pb.fmt(old)}\nدلوقتي: {pb.fmt(price)}{drop}"
+        if p.get("coupon"):
+            text += f"\n🎟️ كوبون: {p['coupon']}"
+    if kind != "coupon":
+        text += f"\n\n{vtxt}"
+    try:
+        await send_card(bot, chat, p, text, alert_kb(p))
+        ph.log_event("alert", chat, p["asin"])
+    except Exception as e:
+        log.warning("notify failed: %s", type(e).__name__)
+    await asyncio.sleep(0.05)
 
-    async def fetch(p):
+
+async def check_all(bot, chats=None, always_report=False):
+    """بيفحص كل المنتجات: المنتج اللي أكتر من شخص بيتابعه بيتقري مرة واحدة، وكلها بالتوازي."""
+    chats = list(chats) if chats is not None else list(tracked.keys())
+    keys = {}
+    for ch in chats:
+        for p in tracked.get(ch, []):
+            keys[(p["host"], p["asin"])] = None
+    sem = asyncio.Semaphore(FETCH_PARALLEL)
+
+    async def fetch(key):
         async with sem:
             try:
-                prod = await asyncio.to_thread(fetch_by_asin, p["host"], p["asin"], [])
+                keys[key] = await asyncio.to_thread(fetch_by_asin, key[0], key[1], [])
             except Exception as e:
                 log.warning("check failed: %s", type(e).__name__)
-                prod = None
-            await asyncio.sleep(1)
-            return prod
+            await asyncio.sleep(0.3)
 
-    snapshot = list(items)
-    results = await asyncio.gather(*(fetch(p) for p in snapshot))
-    for p, prod in zip(snapshot, results):
-        price = prod["price"] if prod else None
-        if price is None:
+    await asyncio.gather(*(fetch(k) for k in keys))
+    for ch in chats:
+        try:
+            await process_chat(bot, ch, keys, always_report)
+        except Exception as e:
+            log.warning("chat check failed: %s", type(e).__name__)
+
+
+async def process_chat(bot, chat, results, always_report):
+    for p in list(tracked.get(chat, [])):
+        prod = results.get((p["host"], p["asin"]))
+        if prod is None:
             if always_report:
                 await bot.send_message(int(chat), f"{p['title'][:50]}\nمقدرتش أجيب سعره دلوقتي.")
             continue
+        price = prod["price"]
+        if price is None:
+            p["miss"] = p.get("miss", 0) + 1
+            if p["miss"] >= 2 and p.get("avail", True):
+                p["avail"] = False  # مرتين ورا بعض من غير سعر: المنتج خلص
+                with lock:
+                    save()
+            if always_report:
+                await bot.send_message(int(chat), f"{p['title'][:50]}\nمش متوفر دلوقتي.")
+            continue
+        was_gone = p.get("avail", True) is False
+        p["miss"], p["avail"] = 0, True
+        ph.record(p["asin"], price)
         old = p["last"]
         notify = decide(p, price)
+        coupon = prod.get("coupon")
+        new_coupon = bool(coupon) and coupon != p.get("coupon")
+        p["coupon"], p["old"] = coupon, prod.get("old")
+        if prod.get("image"):
+            p["image"] = prod["image"]
         p["last"] = price
         with lock:
             save()
-        if notify:
-            drop = ""
-            if price < old:
-                drop = f" (نزل {round((old - price) / old * 100)}%)"
-            try:
-                await bot.send_message(
-                    int(chat),
-                    f"📉 السعر نزل!\n{p['title'][:80]}\n"
-                    f"كان: {pb.fmt(old)}\nدلوقتي: {pb.fmt(price)}{drop}\n\n{link_for(p)}",
-                )
-            except Exception as e:
-                log.warning("notify failed: %s", type(e).__name__)
+        if was_gone:
+            await send_alert(bot, chat, p, "back", old, price)
+        elif notify:
+            await send_alert(bot, chat, p, "drop", old, price)
+        elif new_coupon:
+            await send_alert(bot, chat, p, "coupon", old, price)
         elif always_report:
             await bot.send_message(int(chat), f"{p['title'][:50]}\nالسعر: {pb.fmt(price)}")
 
 
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
-    for chat in list(tracked.keys()):
-        try:
-            await check_chat(context.bot, chat)
-        except Exception as e:
-            log.warning("chat check failed: %s", type(e).__name__)
+    await check_all(context.bot)
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,6 +857,10 @@ def main():
         return
     if os.environ.get("PORT"):
         threading.Thread(target=run_server, daemon=True).start()
+    ph.init()
+    for lst in tracked.values():  # نبدأ تاريخ الأسعار من آخر سعر معروف لكل منتج متتبَّع
+        for p in lst:
+            ph.record(p["asin"], p.get("last"))
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = (
         Application.builder()
@@ -429,6 +879,8 @@ def main():
     app.add_handler(CommandHandler("list", list_items))
     app.add_handler(CommandHandler("remove", remove))
     app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(check_prices, interval=CHECK_EVERY, first=60)
