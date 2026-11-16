@@ -380,7 +380,7 @@ def card_text(p):
     st = ph.stats(p["asin"])
     if st and st["n"] >= 2:
         lines.append(f"📉 أقل سعر سجلته: {pb.fmt(st['min'])} | الأعلى: {pb.fmt(st['max'])}")
-    lines += ["", "🔔 " + target_text(p)]
+    lines += ["", "🛒 اشتري من هنا:", link_for(p), "", "🔔 " + target_text(p)]
     return "\n".join(lines)
 
 
@@ -754,6 +754,7 @@ async def send_alert(bot, chat, p, kind, old, price):
             text += f"\n🎟️ كوبون: {p['coupon']}"
     if kind != "coupon":
         text += f"\n\n{vtxt}"
+    text += f"\n\n🛒 اشتري من هنا:\n{link_for(p)}"
     try:
         await send_card(bot, chat, p, text, alert_kb(p))
         ph.log_event("alert", chat, p["asin"])
