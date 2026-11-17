@@ -39,7 +39,7 @@ MY_TAG = "mixdeals-21"
 CHANNEL_LINK = "https://t.me/PromoCodeOnlain"
 SEARCH_BOT_LINK = "https://t.me/Mix_Compare_bot"
 BOT_LINE = []  # (قديم) السطر بقى جوه FOOTER_LINES
-FOOTER_LINES = ["📢 قناتنا: @PromoCodeOnlain", "🔎 ابحث عن أي منتج: @Mix_Compare_bot"]
+FOOTER_LINES = []  # الأزرار تحت البوست بتغني عن السطور
 BASE = os.path.dirname(os.path.abspath(__file__))
 USERS_FILE = os.path.join(BASE, "allowed_users.json")
 LOGO_FILE = os.path.join(BASE, "logo.png")
@@ -535,7 +535,43 @@ def build_post(title, price, old, rating, link, compact=False):
     return "\n".join(lines)
 
 
+_names = {}
+
+
+async def _bot_username(key, token):
+    if _names.get(key):
+        return _names[key]
+    if not token:
+        return None
+    try:
+        from telegram import Bot
+        async with Bot(token) as b:
+            me = await b.get_me()
+        _names[key] = me.username
+        return me.username
+    except Exception as e:
+        log.warning("username lookup failed (%s): %s", key, type(e).__name__)
+        return None
+
+
+async def channel_kb():
+    """أزرار تحت كل بوست في القناة: تتبع السعر + البحث، وتحتهم أكواد الخصم."""
+    row = []
+    tracker = await _bot_username("tracker", os.environ.get("BOT_TOKEN", ""))
+    if tracker:
+        row.append(InlineKeyboardButton("📉 تتبع سعر أي منتج", url=f"https://t.me/{tracker}"))
+    row.append(InlineKeyboardButton("🔎 ابحث عن أي منتج", url="https://t.me/Mix_Compare_bot"))
+    rows = [row]
+    coupons = await _bot_username("coupons", os.environ.get("COUPON_BOT_TOKEN", ""))
+    if coupons:
+        rows.append([InlineKeyboardButton("🎟️ أكواد الخصم", url=f"https://t.me/{coupons}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def send_post(bot, chat_id, image, post, markup=None):
+    post = post.rstrip()
+    if markup is None and chat_id == CHANNEL:
+        markup = await channel_kb()
     if image and len(post) <= 1000:
         await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML, reply_markup=markup)
         return
