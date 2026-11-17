@@ -7,7 +7,7 @@ import string
 import asyncio
 import logging
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, TimedOut
 from telegram.ext import (
@@ -111,13 +111,50 @@ def is_photo_caption(image, post):
     return bool(image) and len(post) <= 1000
 
 
+SEARCH_BOT = "Mix_Compare_bot"  # بوت البحث
+TRACKER_TOKEN = os.environ.get("BOT_TOKEN", "")  # توكن بوت التتبع: بنسأل تليجرام عن اليوزر بتاعه تلقائي
+COUPON_TOKEN = os.environ.get("COUPON_BOT_TOKEN", "")  # توكن بوت الأكواد (لو موجود بيظهر زرار الأكواد)
+_names = {}
+
+
+async def bot_username(key, token):
+    """يوزر بوت من توكنه (بيتجاب من تليجرام مرة واحدة). لو فشل بيرجع None."""
+    if _names.get(key):
+        return _names[key]
+    if not token:
+        return None
+    try:
+        async with Bot(token) as b:
+            me = await b.get_me()
+        _names[key] = me.username
+        return me.username
+    except Exception as e:
+        log.warning("username lookup failed (%s): %s", key, type(e).__name__)
+        return None
+
+
+async def channel_kb():
+    """أزرار تحت كل بوست في القناة: تتبع السعر + البحث، وتحتهم أكواد الخصم."""
+    row = []
+    tracker = await bot_username("tracker", TRACKER_TOKEN)
+    if tracker:
+        row.append(InlineKeyboardButton("📉 تتبع سعر أي منتج", url=f"https://t.me/{tracker}"))
+    row.append(InlineKeyboardButton("🔎 ابحث عن أي منتج", url=f"https://t.me/{SEARCH_BOT}"))
+    rows = [row]
+    coupons = await bot_username("coupons", COUPON_TOKEN)
+    if coupons:
+        rows.append([InlineKeyboardButton("🎟️ أكواد الخصم", url=f"https://t.me/{coupons}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def send_post(bot, chat_id, image, post):
+    kb = await channel_kb() if chat_id == CHANNEL else None
     if is_photo_caption(image, post):
-        await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML)
+        await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
     if image:
         await bot.send_photo(chat_id, photo=image)
-    await bot.send_message(chat_id, post, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await bot.send_message(chat_id, post, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb)
 
 
 async def clear_src(bot, item):
