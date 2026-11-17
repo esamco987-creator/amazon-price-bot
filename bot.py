@@ -317,6 +317,10 @@ async def send_card(bot, chat, p, text, kb):
     raw = await asyncio.to_thread(get_image, p.get("image"))
     if raw:
         try:
+            raw = await asyncio.to_thread(pb.prepare_image, raw) or raw   # نفس مقاس صور باقي البوتات
+        except Exception:
+            pass
+        try:
             return await bot.send_photo(int(chat), raw, caption=text[:1000], reply_markup=kb)
         except Exception as e:
             log.warning("send photo failed: %s", type(e).__name__)
