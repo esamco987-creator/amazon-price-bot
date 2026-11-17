@@ -458,6 +458,11 @@ def extract_coupon(page, asin=""):
 def fetch_coupon(asin):
     try:
         _, page = pb.get_page(f"https://{MARKETPLACE}/dp/{asin}", [])
+        try:  # أكواد الخصم اللي في الصفحة بتتسجل لبوت الأكواد (من غير أي طلب زيادة)
+            import coupon_store
+            coupon_store.harvest(page, asin)
+        except Exception:
+            pass
         return extract_coupon(page, asin)
     except Exception as e:
         log.warning("coupon fetch failed: %s", type(e).__name__)
@@ -572,6 +577,12 @@ def scan_once():
     coupons = 0
     for it in best:
         it["coupon"] = fetch_coupon(it["asin"])
+        if it["coupon"]:
+            try:
+                import coupon_store
+                coupon_store.record_clip(it["asin"], it.get("title"), it["coupon"], it.get("price"))
+            except Exception:
+                pass
         coupons += 1 if it["coupon"] else 0
         image = None
         card = False
