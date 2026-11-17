@@ -29,10 +29,7 @@ API_HASH = os.environ["API_HASH"]
 SOURCES = ["OffersEgyptofficial", "Mego_Reviews", "ba3bou3_deals", "Raw5aa"]
 PRIVATE_TITLE = "مسودة العروض"
 MY_TAG = "mixdeals-21"
-FOOTER = (
-    "📢 قناتنا: @PromoCodeOnlain\n"
-    "🔎 ابحث عن أي منتج: @Mix_Compare_bot"
-)
+FOOTER = ""  # الأزرار تحت البوست بتغني عن السطور دي
 
 HEADERS = {
     "User-Agent": (
@@ -151,7 +148,9 @@ def promo_image(url, fallback_title):
     """كولاج من منتجات صفحة عرض (اشتري 3 بسعر 2 ...) مع عنوان العرض."""
     info = promos.load_promo(url)
     if not info or not info["products"]:
-        return None
+        # أمازون مرجّعش منتجات الصفحة: كارت بعنوان العرض بدل ما البوست يطلع من غير صورة
+        t = (info or {}).get("title") or fallback_title
+        return deal_card.make_text_promo_card(t, (info or {}).get("dates"))
     imgs = []
     for p in info["products"][:8]:
         if len(imgs) >= 4:
@@ -221,7 +220,8 @@ def build_post(lines, urls):
             parts.append(f'🛒 <a href="{html.escape(u, quote=True)}">اضغط هنا لفتح العرض على أمازون</a>')
         else:
             parts.append("🛒 اشتري من هنا:\n" + esc(u))
-    parts.append(esc(FOOTER))
+    if FOOTER:
+        parts.append(esc(FOOTER))
     return "\n\n".join(parts)
 
 
