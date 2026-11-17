@@ -473,7 +473,7 @@ def fetch_coupon(asin):
 def footer_lines():
     """الفوتر من post_bot لو موجود، وإلا الفوتر القديم (عشان البوت ما يقعش لو الملفات مش متطابقة)."""
     f = getattr(pb, "FOOTER_LINES", None)
-    if f:
+    if f is not None:
         return list(f)
     return ["📢 قناة عروض وخصومات", "للمزيد من العروض يوميًا:", pb.CHANNEL_LINK] + list(getattr(pb, "BOT_LINE", []))
 
