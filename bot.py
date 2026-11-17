@@ -237,6 +237,13 @@ def fetch_by_asin(host, asin, debug):
     if st != "ok":
         return None
     prod.update({"asin": asin, "host": host, "coupon": extract_coupon(small, asin) if prod["price"] else None})
+    try:  # أكواد وكوبونات الصفحة بتتسجل لبوت الأكواد (من غير أي طلب زيادة)
+        import coupon_store
+        coupon_store.harvest(small, asin)
+        if prod["coupon"]:
+            coupon_store.record_clip(asin, prod["title"], prod["coupon"], prod["price"])
+    except Exception:
+        pass
     return prod
 
 
