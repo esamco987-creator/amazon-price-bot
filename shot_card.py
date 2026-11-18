@@ -183,10 +183,25 @@ def find_price_box(words, price, pct=None, top_limit=0, im=None):
         cands.append(b)
     if im is not None:
         cands += price_candidates_by_color(im, price, top_limit)[:6]
+    if im is not None:
+        cands += price_candidates_by_digits(words, im, top_limit)
     for b in cands:
         if im is None or _crop_has_price(im, b, price):
             return b
     return None
+
+
+def price_candidates_by_digits(words, im, top_limit, limit=6):
+    """السعر مفيهوش نسبة خصم (منتج بسعر واحد): بنجرّب الأرقام الكبيرة في العمود الشمال (الأكبر خط الأول)،
+    وكل مستطيل بيتأكد منه بقراءة المنطقة تاني."""
+    ws = [w for w in words if re.search(r"\d", w["t"]) and w["h"] >= 16 and w["tp"] >= top_limit
+          and w["l"] < im.width * 0.62]
+    ws.sort(key=lambda w: -w["h"])
+    out = []
+    for w in ws[:limit]:
+        out.append([w["l"] - w["w"] * 1.5 - 8, w["tp"] - 0.4 * w["h"],
+                    w["l"] + w["w"] * 1.7 + 8, w["tp"] + 2.1 * w["h"]])
+    return out
 
 
 def _find_price_box_digits(words, price):
@@ -230,11 +245,42 @@ def _green_bands(im, x_limit, y_from):
     return bands
 
 
+def _orange_bands(im, x_limit, y_from):
+    """شارة "الكوبون:" البرتقالي: [(top, bottom, left, right)]. النجوم أرفع من كده فبتتفلتر."""
+    from PIL import ImageChops
+    crop = im.crop((0, 0, max(10, int(x_limit)), im.height))
+    h, s, v = crop.convert("HSV").split()
+    m = ImageChops.multiply(ImageChops.multiply(h.point(lambda x: 255 if 12 <= x <= 30 else 0),
+                                                s.point(lambda x: 255 if x >= 140 else 0)),
+                            v.point(lambda x: 255 if x >= 200 else 0))
+    raw, W = m.tobytes(), crop.width
+    min_px = max(12, W // 40)
+    out, start = [], None
+    for y in range(int(y_from), crop.height + 1):
+        on = y < crop.height and raw[y * W:(y + 1) * W].count(255) >= min_px
+        if on and start is None:
+            start = y
+        elif not on and start is not None:
+            if 18 <= y - start <= 48:
+                sub = m.crop((0, start, W, y))
+                bb = sub.getbbox()
+                if bb and 40 <= bb[2] - bb[0] <= 160:
+                    out.append((start, y, bb[0], bb[2]))
+            start = None
+    return out
+
+
 def find_coupon_boxes(words, below_y, im=None, right_edge=None):
-    """مستطيل لكل كوبون. الأساس هو الشارة الخضرا؛ والكود (حروف كبيرة + أرقام) بيوسّع المستطيل لو نزل سطر زيادة."""
+    """مستطيل لكل كوبون. الأساس هو الشارة (البرتقالي "الكوبون:" أو الخضرا)؛ والكود (حروف كبيرة + أرقام) بيوسّع المستطيل لو نزل سطر زيادة."""
     codes = [w for w in words if CODE_RE.match(w["t"]) and 5 <= len(w["t"]) <= 14 and w["tp"] > below_y]
     right = max([w["l"] + w["w"] for w in codes] + [right_edge or 0]) + 10
     if im is not None and right > 40:
+        ob = _orange_bands(im, im.width * 0.62, below_y)
+        if ob:
+            boxes = []
+            for t, bt, l, r in ob:
+                boxes.append([2, t - 8, max(right, r + 14), bt + (bt - t) * 1.0 + 4])   # السطر + "الشروط" تحته
+            return boxes
         bands = _green_bands(im, right, below_y)
         if bands:
             boxes = []
