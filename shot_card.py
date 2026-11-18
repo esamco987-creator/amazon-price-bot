@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import logging
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 import deal_card as dc
 
@@ -424,6 +424,29 @@ def _banner(card, bh):
     d.text((int(40 * k), mid), dc.LINK, font=dc.font(max(12, int(34 * k))), fill=dc.WHITE, anchor="lm")
 
 
+def read_coupon_text(im):
+    """بيقرا قيمة الكوبون من سطر شارة "الكوبون:" البرتقالي في اللقطة: "وفّر 7.65 جنيه" أو "وفّر 5%". None لو مقراش."""
+    try:
+        for t, bt, l, r in _orange_bands(im, im.width * 0.62, 0):
+            crop = im.crop((0, max(0, t - 6), int(im.width * 0.62), bt + 6))
+            g = ImageOps.autocontrast(crop.convert("L").resize((crop.width * 3, crop.height * 3), Image.LANCZOS))
+            with tempfile.TemporaryDirectory() as td:
+                p = os.path.join(td, "c.png")
+                g.save(p)
+                out = subprocess.run(["tesseract", p, "stdout", "-l", "eng", "--psm", "6"],
+                                     capture_output=True, text=True, timeout=30).stdout
+            m = re.search(r"EGP\s*(\d+(?:[.,]\d{1,2})?)", out, re.I)
+            if m:
+                v = m.group(1).replace(",", ".")
+                return f"وفّر {v[:-3] if v.endswith('.00') else v} جنيه"
+            m = re.search(r"(\d{1,2})\s*%", out)
+            if m:
+                return f"وفّر {m.group(1)}%"
+    except Exception as e:
+        log.warning("coupon text failed: %s", type(e).__name__)
+    return None
+
+
 def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
     """raw: بايتات لقطة الشاشة. يرجع (JPEG بايتات, {"price": bool, "coupons": عدد, "rating_hidden": bool})."""
     im = Image.open(io.BytesIO(raw)).convert("RGB")
@@ -465,6 +488,7 @@ def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
         for b in cboxes:
             od.rounded_rectangle(_clamp(b, im), radius=8, fill=COUPON_FILL, outline=COUPON_LINE + (255,), width=lw)
         info["coupons"] = len(cboxes)
+        info["coupon"] = read_coupon_text(im) if cboxes else None
         log.warning("shot: price_box=%s coupons=%d rating=%s", bool(pbox), len(cboxes), bool(rbox))
         im = Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB")
     except Exception as e:
