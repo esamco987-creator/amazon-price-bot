@@ -202,8 +202,8 @@ def price_candidates_by_digits(words, im, top_limit, limit=6):
     ws.sort(key=lambda w: -w["h"])
     out = []
     for w in ws[:limit]:
-        out.append([w["l"] - w["w"] * 1.5 - 8, w["tp"] - 0.4 * w["h"],
-                    w["l"] + w["w"] * 1.7 + 8, w["tp"] + 2.1 * w["h"]])
+        out.append([w["l"] - 2.6 * w["h"] - 6, w["tp"] - 0.35 * w["h"],
+                    w["l"] + w["w"] + 1.5 * w["h"] + 6, w["tp"] + 1.35 * w["h"]])
     return out
 
 
@@ -285,6 +285,14 @@ def find_coupon_boxes(words, below_y, im=None, right_edge=None):
             boxes = []
             for t, bt, l, r in ob:
                 boxes.append([2, t - 8, max(right, r + 14), bt + (bt - t) * 1.0 + 4])   # السطر + "الشروط" تحته
+            # شارات خضرا تحتها ("وفر 5% على 5 سلعة"): مستطيل لكل واحدة، من غير اللي ملمسة الكوبون ولا المقطوعة من آخر الصورة
+            for t, bt in _green_bands(im, right, below_y):
+                if bt >= im.height - 6:
+                    continue
+                if any(t < b[3] and bt > b[1] for b in boxes):
+                    continue
+                boxes.append([2, t - 6, right, bt + (bt - t) * 0.9 + 4])
+            boxes.sort(key=lambda b: b[1])
             return boxes
         bands = _green_bands(im, right, below_y)
         if bands:
