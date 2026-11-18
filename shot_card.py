@@ -41,8 +41,10 @@ def _ocr_words(img):
             r = subprocess.run([exe, p, "stdout", "-l", "eng", "--psm", "11", "tsv"],
                                capture_output=True, text=True, timeout=60)
         except Exception as e:
-            log.warning("ocr failed: %s", type(e).__name__)
+            log.warning("ocr failed: %s %s", type(e).__name__, str(e)[:150])
             return []
+    if r.returncode != 0 or not r.stdout.strip():
+        log.warning("ocr empty: rc=%s err=%s", r.returncode, (r.stderr or "")[:200].replace("\n", " "))
     words = []
     for line in r.stdout.splitlines()[1:]:
         c = line.split("\t")
@@ -371,7 +373,11 @@ def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
         im = im.resize((MAX_W, int(im.height * MAX_W / im.width)), Image.LANCZOS)
     info = {"price": False, "coupons": 0, "rating_hidden": False}
     try:
+        import time as _t
+        _t0 = _t.time()
         words = _ocr_words(im)
+        log.warning("shot: size=%sx%s words=%d ocr=%.1fs price=%s pct=%s", im.width, im.height, len(words),
+                    _t.time() - _t0, price, pct)
         pbox = find_price_box(words, price, pct, im.height * 0.12, im) if words else None
         below = pbox[3] if pbox else 0
         rbox = find_rating_box(words, pbox[1] if pbox else im.height * 0.4) if words else None
@@ -389,6 +395,7 @@ def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
         for b in cboxes:
             od.rounded_rectangle(_clamp(b, im), radius=8, fill=COUPON_FILL, outline=COUPON_LINE + (255,), width=lw)
         info["coupons"] = len(cboxes)
+        log.warning("shot: price_box=%s coupons=%d rating=%s", bool(pbox), len(cboxes), bool(rbox))
         im = Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB")
     except Exception as e:
         log.warning("marking failed: %s", type(e).__name__)
