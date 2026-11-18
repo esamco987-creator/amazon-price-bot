@@ -28,12 +28,13 @@ CODE_RE = re.compile(r"^[A-Z][A-Z0-9]*\d{2,}$")
 BANNER_H_RATIO = 100 / 1200.0   # ارتفاع الشريط نسبة للعرض (زي كروت العروض)
 
 
-def _ocr_words(img):
+def _ocr_words(img, scale=None):
     """يرجع قايمة كلمات [{t,l,t,w,h,conf}] بإحداثيات الصورة الأصلية. [] لو tesseract مش متاح."""
     exe = shutil.which("tesseract")
     if not exe:
         return []
-    big = img.resize((img.width * SCALE, img.height * SCALE), Image.LANCZOS)
+    scale = scale or SCALE
+    big = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
     with tempfile.TemporaryDirectory() as td:
         p = os.path.join(td, "in.png")
         big.save(p)
@@ -58,8 +59,8 @@ def _ocr_words(img):
             continue
         words.append({
             "t": c[11].strip(),
-            "l": int(c[6]) / SCALE, "tp": int(c[7]) / SCALE,
-            "w": int(c[8]) / SCALE, "h": int(c[9]) / SCALE,
+            "l": int(c[6]) / scale, "tp": int(c[7]) / scale,
+            "w": int(c[8]) / scale, "h": int(c[9]) / scale,
             "conf": conf,
         })
     return words
@@ -276,6 +277,8 @@ def find_coupon_boxes(words, below_y, im=None, right_edge=None):
     """مستطيل لكل كوبون. الأساس هو الشارة (البرتقالي "الكوبون:" أو الخضرا)؛ والكود (حروف كبيرة + أرقام) بيوسّع المستطيل لو نزل سطر زيادة."""
     codes = [w for w in words if CODE_RE.match(w["t"]) and 5 <= len(w["t"]) <= 14 and w["tp"] > below_y]
     right = max([w["l"] + w["w"] for w in codes] + [right_edge or 0]) + 10
+    if im is not None and right <= 40:
+        right = int(im.width * 0.55)     # مفيش مستطيل سعر: نفترض عرض العمود الشمال
     if im is not None and right > 40:
         ob = _orange_bands(im, im.width * 0.62, below_y)
         if ob:
@@ -379,6 +382,16 @@ def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
         log.warning("shot: size=%sx%s words=%d ocr=%.1fs price=%s pct=%s", im.width, im.height, len(words),
                     _t.time() - _t0, price, pct)
         pbox = find_price_box(words, price, pct, im.height * 0.12, im) if words else None
+        if not pbox and price:
+            # قراءة تانية للعمود الشمال لوحده بتكبير مختلف (الأرقام الكبيرة بتتقري أحسن لما الصورة تبقى أصغر)
+            left = im.crop((0, 0, int(im.width * 0.62), im.height))
+            for sc_ in (2, 3):
+                extra = _ocr_words(left, sc_)
+                if extra:
+                    words = words + extra
+                    pbox = find_price_box(words, price, pct, im.height * 0.12, im)
+                    if pbox:
+                        break
         below = pbox[3] if pbox else 0
         rbox = find_rating_box(words, pbox[1] if pbox else im.height * 0.4) if words else None
         cboxes = find_coupon_boxes(words, below, im, (pbox[2] if pbox else None)) if words else []
