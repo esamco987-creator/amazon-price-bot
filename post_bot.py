@@ -477,6 +477,37 @@ def prepare_image(data):
         return None
 
 
+def coupon_final(price, coupon):
+    """من نص الكوبون ("وفّر 7.65 جنيه" أو "وفّر 5%") يحسب السعر بعد الكوبون. بيرجع None لو مقدرش."""
+    try:
+        if not price or not coupon:
+            return None
+        m = re.search(r"(\d+(?:[.,]\d+)?)", coupon)
+        if not m:
+            return None
+        v = float(m.group(1).replace(",", "."))
+        if "%" in coupon or "٪" in coupon:
+            final = price * (1 - v / 100.0)
+        else:
+            final = price - v
+        if v <= 0 or final <= 0 or final >= price:
+            return None
+        return round(final, 2)
+    except Exception:
+        return None
+
+
+def coupon_block(price, coupon):
+    """سطور الكوبون في البوست: الكوبون + السعر بعد الكوبون (لو اتحسب)."""
+    if not coupon:
+        return []
+    lines = [f"🎟 <b>كوبون إضافي:</b> {html.escape(coupon)}", "(فعّل الكوبون من صفحة المنتج قبل الشراء)"]
+    final = coupon_final(price, coupon)
+    if final:
+        lines += [f"✅ <b>السعر بعد الكوبون: {fmt(final)}</b>"]
+    return lines + [""]
+
+
 # True = بوست مختصر تحت الكارت. False = البوست الكامل (العنوان والسعر والخصم) زي الأول.
 COMPACT_POST = False
 
@@ -516,21 +547,22 @@ def short_title(t, limit=95):
     return t[:limit].rsplit(" ", 1)[0] + "…"
 
 
-def build_post(title, price, old, rating, link, compact=False):
+def build_post(title, price, old, rating, link, compact=False, coupon=None):
     pct = round((old - price) / old * 100) if (price and old and old > price) else None
+    cl = coupon_block(price, coupon)
     if compact and pct:
         # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
         return "\n".join([
             opener(pct, title) + f" — {fmt(price)} بدل {fmt(old)}",
-            "", "🛒 اشتري من هنا:", link, "",
-        ] + FOOTER_LINES)
+            "",
+        ] + cl + ["🛒 اشتري من هنا:", link, ""] + FOOTER_LINES)
     lines = [opener(pct, title), "", f"<b>{html.escape(short_title(title))}</b>", ""]
     if price:
         lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
         if old:
             pct = round((old - price) / old * 100)
             lines.append(f"🏷️ كان: <s>{fmt(old)}</s> (خصم {pct}%)")
-    lines += ["", "🛒 اشتري من هنا:", link, ""]
+    lines += [""] + cl + ["🛒 اشتري من هنا:", link, ""]
     lines += FOOTER_LINES
     return "\n".join(lines)
 
@@ -647,9 +679,9 @@ def process_link(url):
         coupon = None
     card = product_card(title, price, old, raw, {"rating": rating, "coupon": coupon})
     image = card or (prepare_image(raw) if raw else None)
-    post = build_post(title, price, old, rating, link, compact=COMPACT_POST and bool(card))
+    post = build_post(title, price, old, rating, link, compact=COMPACT_POST and bool(card), coupon=coupon)
     return True, {"image": image, "post": post, "price": price, "title": title, "old": old, "rating": rating,
-                  "link": link, "asin": asin, "host": host}
+                  "link": link, "asin": asin, "host": host, "coupon": coupon}
 
 
 # ---------------------------------------------------------------- handlers
@@ -760,7 +792,8 @@ def _make_shot_draft(raw, url):
     if ok:
         price, old = res["price"], res["old"]
         img, info = shot_card.make_shot(raw, price=price, pct=_pct_of(price, old))
-        post = build_post(res["title"], price, old, res["rating"], res["link"], compact=bool(_pct_of(price, old)))
+        post = build_post(res["title"], price, old, res["rating"], res["link"], compact=bool(_pct_of(price, old)),
+                          coupon=res.get("coupon"))
         return True, {"image": img, "post": post, "info": info}
     asin = find_asin(url)
     if not asin:
