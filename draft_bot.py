@@ -147,14 +147,25 @@ async def channel_kb():
     return InlineKeyboardMarkup(rows)
 
 
+def _remember(image, post):
+    """بيسجّل البوست اللي اتنشر في القناة عشان بوت إعادة النشر (repost_bot.py)."""
+    try:
+        import repost_store
+        repost_store.record(image, post)
+    except Exception as e:
+        log.warning("repost record skipped: %s", type(e).__name__)
+
+
 async def send_post(bot, chat_id, image, post):
     kb = await channel_kb() if chat_id == CHANNEL else None
     if is_photo_caption(image, post):
         await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML, reply_markup=kb)
-        return
-    if image:
-        await bot.send_photo(chat_id, photo=image)
-    await bot.send_message(chat_id, post, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb)
+    else:
+        if image:
+            await bot.send_photo(chat_id, photo=image)
+        await bot.send_message(chat_id, post, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=kb)
+    if chat_id == CHANNEL:
+        _remember(image, post)
 
 
 async def clear_src(bot, item):
