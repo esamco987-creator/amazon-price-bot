@@ -191,7 +191,56 @@ def find_price_box(words, price, pct=None, top_limit=0, im=None):
     for b in cands:
         if im is None or _crop_has_price(im, b, price):
             return b
+    if im is not None:
+        return price_box_by_divider(im, top_limit)
     return None
+
+
+def price_box_by_divider(im, top_limit=0):
+    """آخر حل من غير قراءة نصوص: أول سطر كبير بعد الخط الفاصل (تحت "تم شراء ...") هو السعر في صفحات أمازون."""
+    try:
+        W, H = im.size
+        cw = int(W * 0.5)
+        g = im.convert("L").crop((0, 0, cw, H))
+        raw = g.tobytes()
+        # الخط الفاصل: صف رفيع رمادي فاتح ممتد على أغلب العمود من غير حبر غامق
+        div = None
+        for y in range(int(top_limit), H - 4):
+            row = raw[y * cw:(y + 1) * cw]
+            light = sum(1 for p in row if 150 <= p <= 240)
+            dark = sum(1 for p in row if p < 110)
+            if light >= cw * 0.55 and dark <= 6:
+                div = y
+                break
+        if div is None:
+            return None
+        y = div + 3
+        while y < H - 4 and sum(1 for p in raw[y * cw:(y + 1) * cw] if p < 140) < 2:
+            y += 1
+        start = y
+        while y < H and sum(1 for p in raw[y * cw:(y + 1) * cw] if p < 140) >= 2:
+            y += 1
+        top, bot = start, y
+        if not 12 <= bot - top <= 46:
+            return None
+        cols = [x for x in range(cw) if any(raw[yy * cw + x] < 140 for yy in range(top, bot))]
+        if not cols:
+            return None
+        # آخر تجمّع أعمدة على اليمين (السعر) من غير اللي بعيد عنه
+        groups, gs, gp = [], cols[0], cols[0]
+        for x in cols[1:]:
+            if x - gp > 22:
+                groups.append((gs, gp + 1))
+                gs = x
+            gp = x
+        groups.append((gs, gp + 1))
+        x0, x1 = groups[-1]
+        if x1 - x0 < 40:
+            return None
+        return [x0 - 8, top - 5, x1 + 8, bot + 5]
+    except Exception as e:
+        log.warning("divider price failed: %s", type(e).__name__)
+        return None
 
 
 def price_candidates_by_digits(words, im, top_limit, limit=6):
@@ -389,7 +438,7 @@ def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
         words = _ocr_words(im)
         log.warning("shot: size=%sx%s words=%d ocr=%.1fs price=%s pct=%s", im.width, im.height, len(words),
                     _t.time() - _t0, price, pct)
-        pbox = find_price_box(words, price, pct, im.height * 0.12, im) if words else None
+        pbox = find_price_box(words, price, pct, im.height * 0.12, im)
         if not pbox and price:
             # قراءة تانية للعمود الشمال لوحده بتكبير مختلف (الأرقام الكبيرة بتتقري أحسن لما الصورة تبقى أصغر)
             left = im.crop((0, 0, int(im.width * 0.62), im.height))
@@ -402,7 +451,7 @@ def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
                         break
         below = pbox[3] if pbox else 0
         rbox = find_rating_box(words, pbox[1] if pbox else im.height * 0.4) if words else None
-        cboxes = find_coupon_boxes(words, below, im, (pbox[2] if pbox else None)) if words else []
+        cboxes = find_coupon_boxes(words, below, im, (pbox[2] if pbox else None))
 
         if rbox:   # شيل التقييمات
             ImageDraw.Draw(im).rectangle(_clamp(rbox, im), fill=(255, 255, 255))
