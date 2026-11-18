@@ -43,12 +43,12 @@ HOT_DISCOUNT = 55          # من النسبة دي العرض بيتعلّم "�
 MIN_PRICE = 120            # أقل سعر للمنتج (نشيل المنتجات الرخيصة اللي مالهاش لازمة)
 MIN_RATING = 3.5           # أقل تقييم (لو المنتج عليه تقييم)
 MIN_REVIEWS = 0            # أقل عدد تقييمات (لو العدد معروف)
-SCAN_EVERY = 5 * 60        # كل قد إيه يعيد الفحص (ثواني)
+SCAN_EVERY = 3 * 60        # كل قد إيه يعيد الفحص (ثواني)
 KEYWORDS_PER_ROUND = 8     # عدد كلمات البحث في الدفعة
 MAX_BATCHES = 3            # أقصى عدد دفعات في الجولة (24 طلب بحث على الأكتر، والدفعة التالتة بتتعمل بس لو لسه مفيش عروض كفاية)
-MAX_PER_ROUND = 2          # أقصى عدد عروض بتتبعت في الجولة (أحسن اتنين كل 5 دقايق)
-HOURLY_CAP = 20            # أقصى عدد عروض في الساعة
-DAILY_CAP = 220            # أقصى عدد عروض في اليوم
+MAX_PER_ROUND = 3          # أقصى عدد عروض بتتبعت في الجولة (أحسن 3 كل 3 دقايق)
+HOURLY_CAP = 30            # أقصى عدد عروض في الساعة
+DAILY_CAP = 400            # أقصى عدد عروض في اليوم
 DAILY_REQUESTS = 7500      # أقصى طلبات API في اليوم (حد أمازون 8640)
 RATE_PAUSE = 10 * 60       # لو أمازون قالت "بطّأ" (429)، نوقف الفحص المدة دي
 MIN_SCORE = 30             # أقل "درجة" للعرض عشان يتبعت (الأضعف مش بيتبعت حتى لو عدّى الفلاتر)
@@ -59,6 +59,8 @@ JUNK_WORDS = (             # منتجات هامشية (إكسسوارات رخ�
     "حلق", "خاتم", "اسورة", "إسورة", "سلسلة", "دبوس", "شريط لاصق", "bracelet", "sticker", "screen protector",
     "case for", "phone case", "cover for", "keychain", "ميدالية", "عينة", "sample", "تجريبي",
 )
+SEARCH_PAUSE = 1.2          # ثواني بين طلبات البحث
+BURST_REQUESTS = 500       # طلبات مسموحة زيادة في أول اليوم (الفحص بيتوزع على اليوم كله)
 RESEND_AFTER = 48 * 3600   # نفس المنتج ما يتبعتش تاني قبل المدة دي (إلا لو السعر نزل أكتر)
 
 # كلمات البحث. عدّل فيها زي ما تحب.
@@ -91,6 +93,7 @@ KEYWORDS = [
 KEYWORDS += [
     # كلمات عروض عامة
     "عرض اليوم", "تخفيضات", "خصم كبير", "تصفية", "اقل سعر", "عروض الجمعة البيضاء", "اوفر", "خصم 50%",
+    "black friday", "عروض بلاك فرايداي", "صفقة اليوم", "deal of the day", "خصم 60%", "خصم 70%", "اخر فرصة", "عروض محدودة",
     # إلكترونيات (إنجليزي)
     "headphones", "earbuds", "smart watch", "laptop", "gaming laptop", "monitor", "keyboard", "mouse", "router",
     "power bank", "charger", "tablet", "smartphone", "speaker", "soundbar", "camera", "ssd", "usb flash drive",
@@ -127,6 +130,7 @@ KEYWORDS = list(dict.fromkeys(KEYWORDS))
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SENT_FILE = os.path.join(BASE, "scanner_sent.json")
+KW_FILE = os.path.join(BASE, "scan_kw.json")
 LOG_FILE = os.path.join(BASE, "scan_log.txt")
 
 _token = {"value": None, "exp": 0}
@@ -318,6 +322,46 @@ def parse_items(data):
         except Exception as e:
             log.warning("parse item failed: %s", type(e).__name__)
     return out
+
+
+# ---------------------------------------------------------------- كلمات البحث الذكية
+def load_kw():
+    try:
+        with open(KW_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_kw(d):
+    for k, v in d.items():       # نخلي الإحصائيات تتحدّث مع الوقت
+        if v[0] > 40:
+            v[0], v[1] = v[0] // 2, v[1] // 2
+    try:
+        with open(KW_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("save_kw failed: %s", type(e).__name__)
+
+
+def pick_pool(stats):
+    """ترتيب الكلمات: اللي جابت عروض كويسة قبل كده ليها أولوية، ولسه فيه عشوائية عشان نكتشف كلمات جديدة."""
+    keyed = []
+    for kw in KEYWORDS:
+        reqs, hits = stats.get(kw, [0, 0])
+        rate = min((hits + 0.5) / (reqs + 2.0), 1.5)
+        w = 0.2 + rate * 3
+        keyed.append((random.random() ** (1.0 / w), kw))
+    keyed.sort(reverse=True)
+    return [kw for _, kw in keyed]
+
+
+def day_budget():
+    """طلبات API المسموحة لحد دلوقتي: بتتوزع على اليوم كله عشان الحد ما يخلصش بدري."""
+    t = time.localtime()
+    frac = (t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec) / 86400.0
+    return int(BURST_REQUESTS + DAILY_REQUESTS * frac)
 
 
 # ---------------------------------------------------------------- dedup
@@ -540,12 +584,16 @@ def scan_once():
         note(f"scan skipped: cap reached (last hour {h}/{HOURLY_CAP}, last 24h {d}/{DAILY_CAP})")
         return []
 
-    pool = random.sample(KEYWORDS, len(KEYWORDS))
+    kw_stats = load_kw()
+    pool = pick_pool(kw_stats)
     found = {}
     used = raw = skipped = lowq = 0
     errors = []
     stop = False
     for batch in range(MAX_BATCHES):
+        if requests_today() >= day_budget():
+            note(f"pacing: used {requests_today()} >= budget {day_budget()} -> batch {batch + 1} skipped")
+            break
         kws = pool[batch * KEYWORDS_PER_ROUND:(batch + 1) * KEYWORDS_PER_ROUND]
         for kw in kws:
             used += 1
@@ -561,35 +609,34 @@ def scan_once():
                 log.warning("search '%s' failed: %s", kw, e)
                 time.sleep(3)
                 continue
+            st = kw_stats.setdefault(kw, [0, 0])
+            st[0] += 1
             for it in parse_items(data):
                 raw += 1
                 if not is_good(it):
                     lowq += 1
                 elif is_new(sent, it):
+                    if it["asin"] not in found:
+                        st[1] += 1
                     found.setdefault(it["asin"], it)
                 else:
                     skipped += 1
-            time.sleep(2)
+            time.sleep(SEARCH_PAUSE)
         if stop or len(found) >= max(5, MAX_PER_ROUND * 3):
             break
 
+    save_kw(kw_stats)
     ranked = sorted(found.values(), key=deal_score, reverse=True)
     weak = sum(1 for x in ranked if deal_score(x) < MIN_SCORE)
     ranked = [x for x in ranked if deal_score(x) >= MIN_SCORE]
     best = ranked[:min(MAX_PER_ROUND, left)]
     results = []
     coupons = 0
-    for it in best:
+
+    def prepare(it):
+        """كوبون + صورة + كارت لعرض واحد (بيتعمل بالتوازي عشان نوفّر وقت)."""
         it["coupon"] = fetch_coupon(it["asin"])
-        if it["coupon"]:
-            try:
-                import coupon_store
-                coupon_store.record_clip(it["asin"], it.get("title"), it["coupon"], it.get("price"))
-            except Exception:
-                pass
-        coupons += 1 if it["coupon"] else 0
-        image = None
-        card = False
+        image, card = None, False
         if it["image"]:
             raw_img = pb.download_image(it["image"])
             if raw_img:
@@ -597,6 +644,19 @@ def scan_once():
                 card = bool(image)
                 if not image:
                     image = pb.prepare_image(raw_img)
+        return it, image, card
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        prepared = list(ex.map(prepare, best))
+    for it, image, card in prepared:
+        if it["coupon"]:
+            try:
+                import coupon_store
+                coupon_store.record_clip(it["asin"], it.get("title"), it["coupon"], it.get("price"))
+            except Exception:
+                pass
+        coupons += 1 if it["coupon"] else 0
         results.append((it, build_deal_post(it, compact=COMPACT_POST and card), image))
         sent[it["asin"]] = {"price": it["price"], "ts": time.time(), "q": 1}
     save_sent(sent)
