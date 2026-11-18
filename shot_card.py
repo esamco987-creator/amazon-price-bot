@@ -1,950 +1,609 @@
+"""
+يدوّر على منتجات عليها خصم كبير في أمازون مصر عن طريق الـ API الرسمية (Creators API)،
+وبيرجّع قايمة عروض جاهزة تتبعت لقناة المسودات.
+الإعدادات من متغيرات البيئة: CREATORS_ID و CREATORS_SECRET (والإصدار CREATORS_VERSION، الافتراضي 3.2).
+"""
 import os
-import re
-import io
 import json
+import time
 import html
-import random
-import string
-import asyncio
 import logging
-from urllib.parse import urlparse, urljoin, unquote
+import random
+import re
+import math
 
 import requests
 from bs4 import BeautifulSoup
-from PIL import Image
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+
+import post_bot as pb
+import deal_card
+
+log = logging.getLogger("scanner")
+
+CLIENT_ID = os.environ.get("CREATORS_ID", "")
+CLIENT_SECRET = os.environ.get("CREATORS_SECRET", "")
+VERSION = os.environ.get("CREATORS_VERSION", "3.2")
+
+LANG = os.environ.get("SCAN_LANG", "ar_AE")  # لغة العناوين. اكتب en_AE للإنجليزي، أو فاضي لو مش مدعومة
+
+MARKETPLACE = "www.amazon.eg"
+PARTNER_TAG = "mixdeals-21"
+API_URL = "https://creatorsapi.amazon/catalog/v1/searchItems"
+TOKEN_URLS = {
+    "3.1": "https://api.amazon.com/auth/o2/token",
+    "3.2": "https://api.amazon.co.uk/auth/o2/token",
+    "3.3": "https://api.amazon.co.jp/auth/o2/token",
+}
+
+# True = بوست مختصر تحت الكارت. False = البوست الكامل زي الأول.
+COMPACT_POST = False
+MIN_DISCOUNT = 20          # أقل نسبة خصم (عروض أقل من كده مش بتتبعت)
+MAX_DISCOUNT = 80          # أكتر من كده غالباً سعر قايمة مزيف
+HOT_DISCOUNT = 55          # من النسبة دي العرض بيتعلّم "ممتاز"
+MIN_PRICE = 120            # أقل سعر للمنتج (نشيل المنتجات الرخيصة اللي مالهاش لازمة)
+MIN_RATING = 3.5           # أقل تقييم (لو المنتج عليه تقييم)
+MIN_REVIEWS = 0            # أقل عدد تقييمات (لو العدد معروف)
+SCAN_EVERY = 5 * 60        # كل قد إيه يعيد الفحص (ثواني)
+KEYWORDS_PER_ROUND = 8     # عدد كلمات البحث في الدفعة
+MAX_BATCHES = 3            # أقصى عدد دفعات في الجولة (24 طلب بحث على الأكتر، والدفعة التالتة بتتعمل بس لو لسه مفيش عروض كفاية)
+MAX_PER_ROUND = 2          # أقصى عدد عروض بتتبعت في الجولة (أحسن اتنين كل 5 دقايق)
+HOURLY_CAP = 20            # أقصى عدد عروض في الساعة
+DAILY_CAP = 220            # أقصى عدد عروض في اليوم
+DAILY_REQUESTS = 7500      # أقصى طلبات API في اليوم (حد أمازون 8640)
+RATE_PAUSE = 10 * 60       # لو أمازون قالت "بطّأ" (429)، نوقف الفحص المدة دي
+MIN_SCORE = 30             # أقل "درجة" للعرض عشان يتبعت (الأضعف مش بيتبعت حتى لو عدّى الفلاتر)
+NO_DATA_MIN_PCT = 20       # لو التقييم مش معروف: لازم خصم أكبر
+NO_DATA_MIN_PRICE = 120    # ... وسعر أعلى
+JUNK_WORDS = (             # منتجات هامشية (إكسسوارات رخيصة / حافظات / لزق...)
+    "جراب", "كفر", "حافظة", "حافظه", "واقي شاشة", "لاصق شاشة", "سكرين", "ملصق", "استيكر", "ستيكر",
+    "حلق", "خاتم", "اسورة", "إسورة", "سلسلة", "دبوس", "شريط لاصق", "bracelet", "sticker", "screen protector",
+    "case for", "phone case", "cover for", "keychain", "ميدالية", "عينة", "sample", "تجريبي",
 )
+RESEND_AFTER = 48 * 3600   # نفس المنتج ما يتبعتش تاني قبل المدة دي (إلا لو السعر نزل أكتر)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-for _n in ("httpx", "httpcore", "telegram", "apscheduler", "urllib3"):
-    logging.getLogger(_n).setLevel(logging.WARNING)
-log = logging.getLogger("post_bot")
+# كلمات البحث. عدّل فيها زي ما تحب.
+KEYWORDS = [
+    "هاتف", "سماعات", "ساعة ذكية", "لاب توب", "شاشة", "تابلت",
+    "غسالة", "مكنسة", "قلاية هوائية", "ميكروويف", "عطر", "كاميرا",
+    "ألعاب", "حذاء رياضي", "حقيبة", "مكواة", "خلاط", "مروحة",
+    "شاحن", "باور بانك", "ماوس", "كيبورد", "راوتر", "طابعة",
+    "تلفزيون", "ثلاجة", "مكيف", "سخان", "ماكينة قهوة", "محضر طعام",
+    "ملابس رجالي", "ملابس نسائي", "ملابس أطفال", "حذاء", "نظارة", "ساعة يد",
+    "مكياج", "عناية بالبشرة", "شامبو", "فيتامينات", "حفاضات", "ألعاب أطفال",
+    "أدوات مطبخ", "مفروشات", "إضاءة", "عدة", "دراجة", "حقيبة ظهر",
+    "سماعة بلوتوث", "سماعة رأس", "كشاف", "كاميرا مراقبة", "ميزان", "فرن كهربائي",
+    "عصارة", "غلاية", "محمصة", "مجفف شعر", "ماكينة حلاقة", "فرشاة أسنان كهربائية",
+    "مستحضرات تجميل", "كريم", "صبغة شعر", "مزيل عرق", "منظف", "مناديل",
+    "أثاث", "مرتبة", "وسادة", "ستائر", "سجاد", "حقيبة سفر", "ساعة رياضية",
+    "ملابس رياضية", "جاكيت", "شنطة", "حذاء رجالي", "حذاء نسائي", "لعبة", "ليجو",
+    "كتب", "قرطاسية", "ذاكرة", "هارد ديسك", "كارت ذاكرة", "كابل", "شاشة كمبيوتر",
+    # ماركات ومنتجات مطلوبة
+    "سامسونج", "شاومي", "ايفون", "هواوي", "اوبو", "ريلمي", "انفينيكس", "لينوفو", "اتش بي", "ديل",
+    "سوني", "ال جي", "توشيبا", "فريش", "شارب", "بلايستيشن", "اكس بوكس", "ايرفريشنر", "مكنسة روبوت",
+    "ايربودز", "ساعة ابل", "ريدمي", "ماك بوك", "ايباد", "كاميرا اكشن", "بروجكتور", "سماعة جيمنج",
+    "كرسي مكتب", "مكتب", "ديب فريزر", "بوتجاز", "دفاية", "سخان مياه", "طقم حلل", "طقم سفرة", "مشاية",
+    "اوزان", "مضرب", "شنطة لاب توب", "حفاضات", "حليب اطفال", "كريم اساس", "روج", "ماسكارا", "برفان",
+    "بنطلون", "تيشيرت", "فستان", "قميص", "جزمة", "شبشب", "كوتشي", "ساعة كاسيو", "نظارة شمس",
+    "قهوة", "شاي", "زيت", "منظفات", "مساحيق غسيل", "مكملات غذائية", "بروتين", "فيتامين د",
+]
 
-TOKEN = os.environ.get("POST_BOT_TOKEN", "")
-try:
-    OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-except ValueError:
-    OWNER_ID = 0
+# توسعة نطاق البحث: ماركات وأقسام وكلمات إنجليزي (أمازون مصر عناوينها كتير بالإنجليزي) وكلمات عروض عامة
+KEYWORDS += [
+    # كلمات عروض عامة
+    "عرض اليوم", "تخفيضات", "خصم كبير", "تصفية", "اقل سعر", "عروض الجمعة البيضاء", "اوفر", "خصم 50%",
+    # إلكترونيات (إنجليزي)
+    "headphones", "earbuds", "smart watch", "laptop", "gaming laptop", "monitor", "keyboard", "mouse", "router",
+    "power bank", "charger", "tablet", "smartphone", "speaker", "soundbar", "camera", "ssd", "usb flash drive",
+    "gaming chair", "controller", "projector", "smart tv", "air fryer", "robot vacuum", "coffee machine",
+    # ماركات إلكترونيات وأجهزة
+    "Anker", "JBL", "Logitech", "Asus", "Acer", "MSI", "Honor", "Nokia", "Tecno", "Dyson", "Philips", "Braun",
+    "Tefal", "Bosch", "Kenwood", "Panasonic", "Hisense", "TCL", "Midea", "Zanussi", "Beko", "Ariston", "Tornado",
+    "Black+Decker", "Oral-B", "Xiaomi", "Samsung", "Apple", "Lenovo", "HP", "Sony", "Canon", "Baseus", "Ugreen",
+    "Realme", "Oppo", "Huawei", "Infinix", "Remington", "Babyliss", "Moulinex", "Russell Hobbs", "Cuisinart",
+    # ملابس وأحذية وإكسسوارات
+    "Nike", "Adidas", "Puma", "Skechers", "Reebok", "Under Armour", "Levis", "Casio", "Fossil", "Skagen",
+    "sneakers", "sandals", "backpack", "wallet", "perfume", "watch men", "watch women", "sunglasses", "jacket",
+    "hoodie", "jeans", "dress", "pajamas", "ملابس داخلية", "طقم رياضي", "شنطة يد", "حذاء كاجوال", "صندل",
+    # جمال وعناية وصحة
+    "Nivea", "Garnier", "Loreal", "Maybelline", "Dove", "Vichy", "La Roche Posay", "Cerave", "Neutrogena",
+    "hair dryer", "straightener", "trimmer", "shaver", "serum", "sunscreen", "face wash", "protein powder",
+    "vitamins", "collagen", "omega 3", "مرطب", "واقي شمس", "سيروم", "كولاجين", "اوميجا", "مكمل",
+    # أطفال
+    "Pampers", "Huggies", "Molfix", "Johnson", "Chicco", "Fisher Price", "Lego", "Hot Wheels", "Barbie",
+    "عربة اطفال", "كرسي سيارة", "رضاعة", "ملابس مواليد", "العاب تعليمية",
+    # بيت ومطبخ
+    "Tefal pan", "Pyrex", "Luminarc", "Lock&Lock", "Bosch washing machine", "vacuum cleaner", "blender",
+    "kettle", "toaster", "iron", "fan", "heater", "water heater", "mattress", "pillow", "bedsheet", "curtains",
+    "carpet", "lamp", "led light", "tool set", "drill", "toolbox", "organizer", "طقم مفارش", "لحاف", "بطانية",
+    "مكنسة كهربائية", "طقم ادوات مائدة", "سكاكين", "حلة ضغط", "ترمس", "حافظة طعام",
+    # سيارات ورياضة
+    "dash cam", "car vacuum", "car charger", "tire inflator", "اكسسوارات سيارات", "زيت محرك", "بطارية سيارة",
+    "dumbbell", "yoga mat", "treadmill", "bicycle", "camping", "fitness tracker", "كرة قدم", "جيم",
+    # سوبر ماركت
+    "Nescafe", "Lipton", "Lavazza", "Nutella", "Pringles", "Dettol", "Ariel", "Persil", "Fairy", "Comfort", "Pampers pants",
+    "نسكافيه", "لافازا", "مكرونة", "ارز", "سمن", "عسل", "مكسرات", "تمر",
+]
+KEYWORDS = list(dict.fromkeys(KEYWORDS))
 
-CHANNEL = "@PromoCodeOnlain"
-MY_TAG = "mixdeals-21"
-CHANNEL_LINK = "https://t.me/PromoCodeOnlain"
-SEARCH_BOT_LINK = "https://t.me/Mix_Compare_bot"
-BOT_LINE = []  # (قديم) السطر بقى جوه FOOTER_LINES
-FOOTER_LINES = []  # الأزرار تحت البوست بتغني عن السطور
 BASE = os.path.dirname(os.path.abspath(__file__))
-USERS_FILE = os.path.join(BASE, "allowed_users.json")
-LOGO_FILE = os.path.join(BASE, "logo.png")
+SENT_FILE = os.path.join(BASE, "scanner_sent.json")
+LOG_FILE = os.path.join(BASE, "scan_log.txt")
 
-CANVAS = 1080
-PRODUCT_BOX = 0.80
-LOGO_RATIO = 0.16
-
-OPENERS = [   # قديمة (احتياطي لو مفيش خصم ولا اسم منتج)
-    "🔥 شوف العرض ده!",
-    "⚡ متفوتش العرض ده!",
-    "🛍️ من عروض اليوم",
-    "✅ متاح حاليًا",
-]
+_token = {"value": None, "exp": 0}
+_lang = {"on": True}
+_deal = {"on": True}
+_rev = {"on": True}
+_state = {"pause_until": 0}
+USAGE_FILE = os.path.join(BASE, "scan_usage.json")
+COUPON_DEBUG = os.path.join(BASE, "coupon_debug.txt")
 
 
-def short_name(title, words=4, limit=34):
-    """اسم المنتج المختصر (أول كام كلمة) للجُمل اللي بتبدأ بيها البوستات."""
-    t = re.sub(r"\s+", " ", re.sub(r"[\(\[\|\-–—،,].*$", "", title or "")).strip()
-    t = " ".join(t.split()[:words])
-    return t[:limit].strip()
+class RateLimited(Exception):
+    pass
 
 
-def opener(pct=None, title="", hot=False):
-    """سطر بداية البوست: بيتنوع بين الصياغات (خصم بالنسبة / عرض ممتاز على / توفير حقيقي / عروض اليوم...)."""
-    name = short_name(title)
-    pool = [
-        "🛍️ من عروض اليوم",
-        "👀 شوف العرض ده",
-        "⏳ الحق العرض ده قبل ما يخلص",
-        "✅ متاح حاليًا",
-        "🔥 متفوتش العرض ده",
-    ]
-    if pct and pct >= 5:
-        pool += [f"🔥 عرض بخصم {pct}%", f"💰 عرض توفير حقيقي — خصم {pct}%", f"🏷️ خصم {pct}% دلوقتي"]
-        if pct >= 50 or hot:
-            pool += [f"🚨 عرض ممتاز — خصم {pct}%", "⏳ الحق العرض ده قبل ما يخلص"]
-    if name and pct and pct >= 20:
-        pool += [f"⭐ عرض ممتاز على {name}", f"💥 عرض توفير حقيقي على {name}"]
-    return random.choice(pool)
-
-
-CLOSERS = [
-    "⏳ الكمية والسعر ممكن يتغيروا في أي وقت.",
-    "👌 اطلبه قبل ما يخلص.",
-    "🚚 تأكد من السعر النهائي قبل الشراء.",
-    "✅ شوف التفاصيل من الرابط.",
-]
-
-UA_CHROME = (
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-)
-UA_DESKTOP = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-UA_BOT = "Mozilla/5.0 (compatible; TelegramBot/1.0; +https://telegram.org)"
-
-HEADER_STRATEGIES = [
-    {"User-Agent": UA_CHROME},
-    {
-        "User-Agent": UA_DESKTOP,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
-    },
-    {"User-Agent": UA_BOT},
-]
-
-AMAZON_HOSTS = ("amazon.", "amzn.", "a.co", "link.amazon")
-
-
-# ---------------------------------------------------------------- users
-def load_users():
+def note(msg):
+    """سطر في ملف scan_log.txt عشان نعرف الفحص عمل إيه."""
     try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def enabled():
+    return bool(CLIENT_ID and CLIENT_SECRET)
+
+
+# ---------------------------------------------------------------- auth
+def get_token():
+    if _token["value"] and time.time() < _token["exp"] - 60:
+        return _token["value"]
+    url = TOKEN_URLS.get(VERSION, TOKEN_URLS["3.2"])
+    r = requests.post(
+        url,
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scope": "creatorsapi::default",
+        },
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"token status {r.status_code}: {r.text[:150]}")
+    d = r.json()
+    _token["value"] = d["access_token"]
+    _token["exp"] = time.time() + int(d.get("expires_in", 3600))
+    return _token["value"]
+
+
+# ---------------------------------------------------------------- api
+def count_request():
+    """بيعدّ طلبات الـAPI في اليوم (عشان منعدّيش الحد)."""
+    day = time.strftime("%Y-%m-%d")
+    try:
+        with open(USAGE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    if d.get("day") != day:
+        d = {"day": day, "n": 0}
+    d["n"] += 1
+    try:
+        with open(USAGE_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+    return d["n"]
+
+
+def requests_today():
+    try:
+        with open(USAGE_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d["n"] if d.get("day") == time.strftime("%Y-%m-%d") else 0
+    except Exception:
+        return 0
+
+
+def search(keyword, page=1):
+    count_request()
+    body = {
+        "partnerTag": PARTNER_TAG,
+        "keywords": keyword,
+        "marketplace": MARKETPLACE,
+        "itemCount": 10,
+        "itemPage": page,
+        "minSavingPercent": MIN_DISCOUNT,
+        "resources": [
+            "images.primary.large",
+            "itemInfo.title",
+            "offersV2.listings.price",
+            "offersV2.listings.availability",
+            "offersV2.listings.isBuyBoxWinner",
+        ],
+    }
+    if _deal["on"]:
+        body["resources"].append("offersV2.listings.dealDetails")
+    if _rev["on"]:
+        body["resources"] += ["customerReviews.count", "customerReviews.starRating"]
+    headers = {
+        "Authorization": f"Bearer {get_token()}",
+        "Content-Type": "application/json",
+        "x-marketplace": MARKETPLACE,
+    }
+    if _lang["on"] and LANG:
+        body["languagesOfPreference"] = [LANG]
+
+    def post():
+        r = requests.post(API_URL, json=body, headers=headers, timeout=40)
+        if r.status_code == 429:
+            raise RateLimited(r.text[:120])
+        return r
+
+    r = post()
+    if r.status_code != 200 and "languagesOfPreference" in body and "lang" in r.text.lower():
+        # اللغة مش مدعومة: كمّل من غيرها
+        log.warning("language %s not accepted, continuing without it: %s", LANG, r.text[:150])
+        _lang["on"] = False
+        body.pop("languagesOfPreference", None)
+        r = post()
+    if r.status_code == 400 and _rev["on"]:
+        # بيانات التقييم مش مدعومة: كمّل من غيرها
+        log.warning("customerReviews not accepted, continuing without it: %s", r.text[:150])
+        _rev["on"] = False
+        body["resources"] = [x for x in body["resources"] if "customerReviews" not in x]
+        r = post()
+    if r.status_code == 400 and _deal["on"]:
+        log.warning("dealDetails not accepted, continuing without it: %s", r.text[:150])
+        _deal["on"] = False
+        body["resources"] = [x for x in body["resources"] if "dealDetails" not in x]
+        r = post()
+    if r.status_code != 200:
+        raise RuntimeError(f"search status {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+
+def parse_items(data):
+    """يرجع قايمة dict: asin, title, price, old, pct, image."""
+    out = []
+    items = ((data or {}).get("searchResult") or {}).get("items") or []
+    for it in items:
+        try:
+            listings = (it.get("offersV2") or {}).get("listings") or []
+            if not listings:
+                continue
+            lst = next((x for x in listings if x.get("isBuyBoxWinner")), listings[0])
+            av = (lst.get("availability") or {}).get("type")
+            if av and av != "IN_STOCK":
+                continue
+            price_obj = lst.get("price") or {}
+            price = (price_obj.get("money") or {}).get("amount")
+            basis = ((price_obj.get("savingBasis") or {}).get("money") or {}).get("amount")
+            pct = (price_obj.get("savings") or {}).get("percentage")
+            if not price or not basis or not pct:
+                continue
+            title = ((it.get("itemInfo") or {}).get("title") or {}).get("displayValue")
+            if not title or float(basis) <= float(price):
+                continue
+            image = (((it.get("images") or {}).get("primary") or {}).get("large") or {}).get("url")
+            badge = ((lst.get("dealDetails") or {}).get("badge")) or ""
+            cr = it.get("customerReviews") or {}
+            rating = cr.get("starRating")
+            if isinstance(rating, dict):
+                rating = rating.get("value")
+            try:
+                rating = float(rating) if rating is not None else None
+            except Exception:
+                rating = None
+            try:
+                reviews = int(cr.get("count")) if cr.get("count") is not None else None
+            except Exception:
+                reviews = None
+            out.append(
+                {
+                    "rating": rating,
+                    "reviews": reviews,
+                    "badge": badge,
+                    "asin": it["asin"],
+                    "title": title,
+                    "price": float(price),
+                    "old": float(basis),
+                    "pct": int(pct),
+                    "image": image,
+                }
+            )
+        except Exception as e:
+            log.warning("parse item failed: %s", type(e).__name__)
+    return out
+
+
+# ---------------------------------------------------------------- dedup
+def load_sent():
+    try:
+        with open(SENT_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
-def save_users(data):
+def save_sent(d):
+    now = time.time()
+    d = {k: v for k, v in d.items() if now - v["ts"] < 7 * 86400}
     try:
-        with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+        with open(SENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
     except Exception as e:
-        log.warning("save_users failed: %s", e)
+        log.warning("save_sent failed: %s", type(e).__name__)
 
 
-ALLOWED = load_users()
-
-DRAFTS = os.path.join(BASE, "drafts")
-PID_RE = re.compile(r"[a-z0-9]{8}")
-
-
-def new_pid():
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-
-
-def _dpath(pid, ext):
-    return os.path.join(DRAFTS, f"{pid}.{ext}")
+def is_new(sent, item):
+    prev = sent.get(item["asin"])
+    if not prev:
+        return True
+    if time.time() - prev["ts"] >= RESEND_AFTER:
+        return True
+    return item["price"] < prev["price"] * 0.95
 
 
-def store_draft(pid, uid, image, post, src=None):
-    os.makedirs(DRAFTS, exist_ok=True)
-    with open(_dpath(pid, "json"), "w", encoding="utf-8") as f:
-        json.dump(
-            {"uid": uid, "post": post, "image": bool(image), "src": src or []},
-            f,
-            ensure_ascii=False,
-        )
-    if image:
-        with open(_dpath(pid, "jpg"), "wb") as f:
-            f.write(image)
+# ---------------------------------------------------------------- quality
+def is_junk(it):
+    t = (it.get("title") or "").lower()
+    return any(w.lower() in t for w in JUNK_WORDS)
 
 
-def load_draft(pid):
-    if not PID_RE.fullmatch(pid or ""):
-        return None
+def is_good(it):
+    """عرض يستاهل: خصم حقيقي، سعر محترم، تقييم كويس وعدد تقييمات يطمّن، ومش منتج هامشي."""
+    if not (MIN_DISCOUNT <= it["pct"] <= MAX_DISCOUNT):
+        return False
+    if it["price"] < MIN_PRICE:
+        return False
+    if is_junk(it):
+        return False
+    rating, reviews = it.get("rating"), it.get("reviews")
+    if rating is None and reviews is None:
+        # مفيش أي بيانات تقييم: مانقدرش نتأكد، فنطلب عرض أقوى بكتير
+        return it["pct"] >= NO_DATA_MIN_PCT and it["price"] >= NO_DATA_MIN_PRICE
+    if rating is not None and rating < MIN_RATING:
+        return False
+    if reviews is not None and reviews < MIN_REVIEWS:
+        return False
+    return True
+
+
+def deal_score(it):
+    """ترتيب العروض: خصم أكبر + سعر أعلى + تقييم أحسن."""
+    rating = it.get("rating")
+    quality = (rating / 5.0) if rating else 0.8
+    reviews = it.get("reviews") or 0
+    trust = 1.0 + min(math.log10(reviews + 1), 3) / 6  # لحد +50%
+    bonus = 1.15 if it.get("badge") else 1.0
+    return it["pct"] * math.log10(it["price"] + 10) * quality * trust * bonus
+
+
+def quota_counts(sent):
+    """بيعدّ العروض اللي النسخة دي بعتتها (علامة q) في آخر ساعة وآخر 24 ساعة."""
+    now = time.time()
+    mine = [v for v in sent.values() if v.get("q")]
+    hour = sum(1 for v in mine if now - v["ts"] < 3600)
+    day = sum(1 for v in mine if now - v["ts"] < 86400)
+    return hour, day
+
+
+def quota_left(sent):
+    """كام عرض لسه مسموح نبعته (حسب حد الساعة وحد اليوم)."""
+    hour, day = quota_counts(sent)
+    return min(HOURLY_CAP - hour, DAILY_CAP - day)
+
+
+# ---------------------------------------------------------------- coupons
+_COUPON_PATTERNS = [
+    r"(?:وفر|وفّر|وفِّر)\s*(?:ج\.?\s?م\.?\s*)?(\d+(?:[.,]\d+)?)\s*(?:%|٪|جنيه|ج\.?\s?م)?[^.\n]{0,30}?(?:القسيمة|قسيمة|كوبون)",
+    r"(?:طبّق|تطبيق|طبق|استخدم)\s*(?:ال)?(?:قسيمة|كوبون)\s*(?:بقيمة|خصم)?\s*(?:EGP\s*|ج\.?\s?م\.?\s*)?(\d+(?:[.,]\d+)?)\s*(?:%|٪|جنيه|ج\.?\s?م)?",
+    r"(?:طبّق|تطبيق|طبق|استخدم)\s*(?:EGP\s*|ج\.?\s?م\.?\s*)?(\d+(?:[.,]\d+)?)\s*(?:%|٪|جنيه|ج\.?\s?م)?\s*(?:ال)?(?:قسيمة|كوبون)",
+    r"Save\s*(?:EGP\s*)?(\d+(?:[.,]\d+)?)\s*(?:%|EGP)?[^.\n]{0,30}?coupon",
+    r"Apply\s*(?:EGP\s*)?(\d+(?:[.,]\d+)?)\s*(?:%|EGP)?\s*coupon",
+]
+_NUM_UNIT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(%|٪|جنيه|ج\.?\s?م|EGP)?")
+
+
+def _fmt_coupon(val, whole):
+    val = val.replace(",", ".")
+    if val.endswith(".0"):
+        val = val[:-2]
+    if "%" in whole or "٪" in whole:
+        return f"وفّر {val}%"
+    return f"وفّر {val} جنيه"
+
+
+def extract_coupon(page, asin=""):
+    """بيدوّر في صفحة المنتج على كوبون (قسيمة) تحت السعر. بيرجع نص أو None."""
     try:
-        with open(_dpath(pid, "json"), "r", encoding="utf-8") as f:
-            d = json.load(f)
-    except Exception:
-        return None
-    img = None
-    if d.get("image"):
-        try:
-            with open(_dpath(pid, "jpg"), "rb") as f:
-                img = f.read()
-        except Exception:
-            img = None
-    d["image"] = img
-    return d
-
-
-def set_src(pid, src):
-    """يحفظ أماكن رسايل المسودة في قناة المسودات عشان تتمسح بعد النشر."""
-    d = load_draft(pid)
-    if d:
-        store_draft(pid, d["uid"], d["image"], d["post"], src)
-
-
-async def clear_src(bot, item):
-    for chat, mid in item.get("src") or []:
-        try:
-            await bot.delete_message(chat, mid)
-        except Exception:
-            pass
-
-
-def drop_draft(pid):
-    if not PID_RE.fullmatch(pid or ""):
-        return
-    for ext in ("json", "jpg"):
-        try:
-            os.remove(_dpath(pid, ext))
-        except OSError:
-            pass
-
-
-def plain(post):
-    return html.unescape(re.sub(r"<[^>]+>", "", post))
-
-
-def make_kb(pid):
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ نشر", callback_data=f"pub:{pid}"),
-                InlineKeyboardButton("✏️ تعديل", callback_data=f"ed:{pid}"),
-            ],
-            [InlineKeyboardButton("❌ إلغاء", callback_data=f"cx:{pid}")],
-        ]
-    )
-
-
-def is_allowed(uid):
-    return uid == OWNER_ID or str(uid) in ALLOWED
-
-
-# ---------------------------------------------------------------- helpers
-AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
-
-
-def parse_price(text):
-    if not text:
-        return None
-    t = text.translate(AR_DIGITS)
-    m = re.search(r"\d[\d,]*\.?\d*", t)
-    if not m:
-        return None
-    num = m.group(0).replace(",", "")
-    try:
-        v = float(num)
-    except ValueError:
-        return None
-    return v if v > 0 else None
-
-
-def fmt(v):
-    if v == int(v):
-        return f"{int(v):,} جنيه"
-    return f"{v:,.2f} جنيه"
-
-
-def first_text(soup, selectors):
-    for sel in selectors:
-        for el in soup.select(sel):
-            t = el.get_text(" ", strip=True)
-            if t:
-                return t
-    return ""
-
-
-def find_asin(text):
-    if not text:
-        return None
-    m = re.search(r"/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})", text)
-    return m.group(1) if m else None
-
-
-def affiliate(host, asin):
-    return f"https://{host}/dp/{asin}?tag={MY_TAG}"
-
-
-def is_amazon_host(host):
-    host = (host or "").lower()
-    return any(p in host for p in AMAZON_HOSTS)
-
-
-def get_page(url, debug):
-    """Try several header strategies. Returns (final_url, html) of the best page."""
-    best = (url, "")
-    for i, headers in enumerate(HEADER_STRATEGIES, 1):
-        try:
-            r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
-            body = r.text or ""
-            has_title = "productTitle" in body
-            debug.append(f"محاولة {i}: حالة {r.status_code}، طول {len(body)}، عنوان {'✔' if has_title else '✘'}")
-            log.info("fetch try %s status=%s len=%s title=%s", i, r.status_code, len(body), has_title)
-            if len(body) > len(best[1]) or (r.url and not best[1]):
-                best = (r.url, body)
-            if r.status_code == 200 and has_title:
-                return r.url, body
-        except Exception as e:
-            debug.append(f"محاولة {i}: خطأ {type(e).__name__}")
-            log.warning("fetch try %s error: %s", i, e)
-    return best
-
-
-def clean_title(t):
-    t = re.sub(r"\s+", " ", t or "").strip()
-    pat = r"\s*[:：|\-–]?\s*(?:amazon\.[a-z.]+|أمازون)"
-    m = re.search(pat, t, flags=re.I)
-    if m:
-        before = t[: m.start()].strip(" :：|-–")
-        t = before if before else re.sub(pat, " ", t, flags=re.I)
-    t = re.sub(r"amazon", "", t, flags=re.I)
-    return re.sub(r"\s+", " ", t).strip(" :：|-–")
-
-
-# أقسام الصفحة اللي فيها أسعار منتجات تانية (مقترحات/إعلانات) ومينفعش نقرا منها سعر المنتج
-_BAD_SECTIONS = ("sims", "similar", "sp_detail", "sponsored", "anonCarousel", "bundle", "percolate", "rhf",
-                 "recently", "customer-reviews", "a-carousel")
-_PRICE_ROOTS = (
-    "#corePriceDisplay_desktop_feature_div", "#corePrice_feature_div", "#apex_desktop",
-    "#apex_offerDisplay_desktop", "#desktop_buybox", "#buybox", "#qualifiedBuybox", "#tabular-buybox",
-    "#centerCol", "#ppd",
-)
-
-
-def _price_roots(soup):
-    for sel in _PRICE_ROOTS:
-        root = soup.select_one(sel)
-        if root is not None:
-            yield root
-
-
-def _bad_section(el, root):
-    for a in el.parents:
-        if a is root:
-            break
-        ident = " ".join(filter(None, [a.get("id", ""), " ".join(a.get("class", []) or [])])).lower()
-        if ident and any(b.lower() in ident for b in _BAD_SECTIONS):
-            return True
-    return False
-
-
-def scoped_price(soup, strike):
-    """سعر المنتج الأساسي (strike=False) أو سعر القائمة المشطوب (strike=True) من صندوق الشراء بس."""
-    for root in _price_roots(soup):
-        if strike:
-            els = root.select("span.a-price.a-text-price, span[data-a-strike='true'], .basisPrice .a-price")
-        else:
-            els = root.select(".a-price:not(.a-text-price)")
-        for el in els:
-            if _bad_section(el, root):
-                continue
-            if not strike and el.get("data-a-strike") == "true":
-                continue
-            off = el.select_one(".a-offscreen")
-            v = parse_price(off.get_text(" ", strip=True)) if off else None
-            if v:
-                return v
-    return None
-
-
-def read_product(page):
-    soup = BeautifulSoup(page, "html.parser")
-
-    title = first_text(soup, ["#productTitle", "span#productTitle", "h1#title span"])
-    if not title:
-        og = soup.find("meta", property="og:title")
-        if og and og.get("content"):
-            title = og["content"]
-    if not title and soup.title and soup.title.string:
-        title = soup.title.string
-    title = clean_title(title)
-
-    price = scoped_price(soup, strike=False)
-    if not price:
-        price = parse_price(first_text(soup, ["#priceblock_ourprice", "#priceblock_dealprice", "#price_inside_buybox"]))
-
-    old = scoped_price(soup, strike=True)
-    if not old:
-        old = parse_price(first_text(soup, ["#listPrice"]))
-    if price and not old:
-        # أمازون كاتبة نسبة الخصم بس: نحسب السعر القديم منها
-        for root in _price_roots(soup):
-            el = root.select_one(".savingPercentage, .savingsPercentage")
-            m = re.search(r"(\d{1,2})\s*%", (el.get_text(" ") if el else "").translate(AR_DIGITS))
-            if m and 3 <= int(m.group(1)) <= 90:
-                old = round(price / (1 - int(m.group(1)) / 100), 2)
-                break
-    if price and old and old <= price:
-        old = None
-
-    rating = ""
-    el = soup.select_one("#acrPopover")
-    if el and el.get("title"):
-        rating = el["title"]
-    if not rating:
-        rating = first_text(soup, ["span.a-icon-alt"])
-    m = re.search(r"\d[.,٫]?\d*", (rating or "").translate(AR_DIGITS))
-    rating = m.group(0).replace(",", ".") if m else ""
-
-    img = ""
-    tag = soup.select_one("#landingImage") or soup.select_one("#imgBlkFront")
-    if tag:
-        dyn = tag.get("data-a-dynamic-image")
-        if dyn:
-            try:
-                d = json.loads(html.unescape(dyn))
-                img = max(d.items(), key=lambda kv: kv[1][0] * kv[1][1])[0]
-            except Exception:
-                img = ""
-        if not img:
-            img = tag.get("data-old-hires") or tag.get("src") or ""
-    if not img:
-        og = soup.find("meta", property="og:image")
-        if og and og.get("content"):
-            img = og["content"]
-    if not img:
-        for sel in ("#imgTagWrapperId img", "#main-image", "#ebooksImgBlkFront", "img[data-old-hires]"):
-            t = soup.select_one(sel)
-            if t:
-                img = t.get("data-old-hires") or t.get("src") or ""
-                if img.startswith("http"):
-                    break
-                img = ""
-    if not img:
-        for pat in (r'"hiRes"\s*:\s*"(https:[^"]+)"', r'"large"\s*:\s*"(https:[^"]+)"'):
-            m = re.search(pat, page)
+        soup = BeautifulSoup(page or "", "html.parser")
+        for t in soup(["script", "style", "noscript"]):
+            t.decompose()
+        box = soup.select_one("#centerCol") or soup.select_one("#ppd") or soup.select_one("#dp-container") or soup
+        # 1) عناصر الكوبون نفسها
+        texts = []
+        for el in box.select("[id*=coupon], [class*=coupon], [id*=Coupon], [class*=Coupon], #vpcButton"):
+            tx = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+            if tx and tx not in texts:
+                texts.append(tx)
+        joined = " | ".join(texts)[:600]
+        for tx in texts:
+            if re.search(r"قسيم|كوبون|coupon", tx, re.I):
+                m = _NUM_UNIT.search(tx)
+                if m:
+                    return _fmt_coupon(m.group(1), m.group(0) + tx[:60])
+        # 2) نص منطقة السعر
+        text = re.sub(r"\s+", " ", box.get_text(" "))
+        for pat in _COUPON_PATTERNS:
+            m = re.search(pat, text, re.I)
             if m:
-                img = m.group(1).replace("\\/", "/")
-                break
-    if not img:
-        for m in re.finditer(r"https://m\.media-amazon\.com/images/I/[A-Za-z0-9%+_-]{8,}[^\"'\s\\<>]*?\.(?:jpg|jpeg|png)", page):
-            if "sprite" not in m.group(0) and "pixel" not in m.group(0):
-                img = m.group(0)
-                break
-
-    return title, price, old, rating, img
-
-
-def full_size(url):
-    return re.sub(r"\._[^/]*?_\.", ".", url) if url else url
+                return _fmt_coupon(m.group(1), m.group(0))
+        if joined or re.search(r"قسيمة|coupon", text, re.I):
+            # شفنا كلمة كوبون بس مفهمناش الرقم: نسجل عينة عشان نظبطها
+            try:
+                with open(COUPON_DEBUG, "a", encoding="utf-8") as f:
+                    f.write(f"{time.strftime('%F %T')} {asin} :: {joined[:300]}\n")
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("coupon parse failed: %s", type(e).__name__)
+    return None
 
 
-def fetch_bytes(url):
-    for headers in ({"User-Agent": UA_CHROME}, {"User-Agent": UA_DESKTOP}):
-        try:
-            r = requests.get(url, headers=headers, timeout=25)
-            if r.status_code == 200 and len(r.content) > 1000:
-                return r.content
+def fetch_coupon(asin):
+    try:
+        _, page = pb.get_page(f"https://{MARKETPLACE}/dp/{asin}", [])
+        try:  # أكواد الخصم اللي في الصفحة بتتسجل لبوت الأكواد (من غير أي طلب زيادة)
+            import coupon_store
+            coupon_store.harvest(page, asin)
         except Exception:
             pass
-    return None
-
-
-def download_image(url):
-    if not url:
-        return None
-    data = fetch_bytes(full_size(url))
-    if not data:
-        data = fetch_bytes(url)
-    return data
-
-
-def prepare_image(data):
-    try:
-        im = Image.open(io.BytesIO(data))
-        if im.mode in ("RGBA", "LA", "P"):
-            im = im.convert("RGBA")
-            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
-            bg.alpha_composite(im)
-            im = bg
-        im = im.convert("RGB")
-        box = int(CANVAS * PRODUCT_BOX)
-        im.thumbnail((box, box), Image.LANCZOS)
-        canvas = Image.new("RGB", (CANVAS, CANVAS), (255, 255, 255))
-        canvas.paste(im, ((CANVAS - im.width) // 2, (CANVAS - im.height) // 2))
-        if os.path.exists(LOGO_FILE):
-            logo = Image.open(LOGO_FILE).convert("RGBA")
-            w = int(CANVAS * LOGO_RATIO)
-            logo = logo.resize((w, int(w * logo.height / logo.width)), Image.LANCZOS)
-            pad = 28
-            canvas.paste(logo, (CANVAS - logo.width - pad, CANVAS - logo.height - pad), logo)
-        out = io.BytesIO()
-        canvas.save(out, "JPEG", quality=92)
-        return out.getvalue()
+        return extract_coupon(page, asin)
     except Exception as e:
-        log.warning("prepare_image failed: %s", e)
+        log.warning("coupon fetch failed: %s", type(e).__name__)
         return None
 
 
-def coupon_final(price, coupon):
-    """من نص الكوبون ("وفّر 7.65 جنيه" أو "وفّر 5%") يحسب السعر بعد الكوبون. بيرجع None لو مقدرش."""
-    try:
-        if not price or not coupon:
-            return None
-        m = re.search(r"(\d+(?:[.,]\d+)?)", coupon)
-        if not m:
-            return None
-        v = float(m.group(1).replace(",", "."))
-        if "%" in coupon or "٪" in coupon:
-            final = price * (1 - v / 100.0)
-        else:
-            final = price - v
-        if v <= 0 or final <= 0 or final >= price:
-            return None
-        return round(final, 2)
-    except Exception:
-        return None
+# ---------------------------------------------------------------- post
+def footer_lines():
+    """الفوتر من post_bot لو موجود، وإلا الفوتر القديم (عشان البوت ما يقعش لو الملفات مش متطابقة)."""
+    f = getattr(pb, "FOOTER_LINES", None)
+    if f is not None:
+        return list(f)
+    return ["📢 قناة عروض وخصومات", "للمزيد من العروض يوميًا:", pb.CHANNEL_LINK] + list(getattr(pb, "BOT_LINE", []))
 
 
-def coupon_block(price, coupon):
-    """سطور الكوبون في البوست: الكوبون + السعر بعد الكوبون (لو اتحسب)."""
-    if not coupon:
+def coupon_lines(item):
+    c = item.get("coupon")
+    if not c:
         return []
-    lines = [f"🎟 <b>كوبون إضافي:</b> {html.escape(coupon)}", "(فعّل الكوبون من صفحة المنتج قبل الشراء)"]
-    final = coupon_final(price, coupon)
-    if final:
-        lines += [f"✅ <b>السعر بعد الكوبون: {fmt(final)}</b>"]
-    return lines + [""]
-
-
-# True = بوست مختصر تحت الكارت. False = البوست الكامل (العنوان والسعر والخصم) زي الأول.
-COMPACT_POST = False
-
-
-def product_card(title, price, old, raw, extra=None):
-    """كارت المنتج: اسم + سعر (+ خصم وسعر قديم وكوبون لو موجودين). None لو مفيش صورة أو سعر."""
-    if not raw or not price or not title:
-        return None
     try:
-        import deal_card
-        pct = 0
-        if old and old > price:
-            pct = int(round((old - price) / old * 100))
-        if pct < 1:
-            pct, old = 0, None
-        item = {"title": title, "price": price, "old": old, "pct": pct}
-        if not pct:
-            item["badge"] = "متاح حاليًا"
-        item.update({k: v for k, v in (extra or {}).items() if v})
-        return deal_card.make_card(item, raw)
-    except Exception as e:
-        log.warning("card failed: %s", type(e).__name__)
-        return None
+        return pb.coupon_block(item.get("price"), c)
+    except Exception:
+        return [f"🎟 <b>كوبون إضافي:</b> {html.escape(c)}", "(فعّل القسيمة من صفحة المنتج قبل الشراء)", ""]
 
 
-def product_image(title, price, old, raw, extra=None):
-    """كارت العرض (لو فيه خصم) وإلا الصورة العادية على خلفية بيضاء."""
-    if not raw:
-        return None
-    return product_card(title, price, old, raw, extra) or prepare_image(raw)
-
-
-def short_title(t, limit=95):
-    t = re.sub(r"\s+", " ", t).strip()
-    if len(t) <= limit:
-        return t
-    return t[:limit].rsplit(" ", 1)[0] + "…"
-
-
-def build_post(title, price, old, rating, link, compact=False, coupon=None):
-    pct = round((old - price) / old * 100) if (price and old and old > price) else None
-    cl = coupon_block(price, coupon)
-    if compact and pct:
+def build_deal_post(item, compact=False):
+    hot = item["pct"] >= HOT_DISCOUNT
+    head = pb.opener(item["pct"], item.get("title", ""), hot)
+    link = pb.affiliate(MARKETPLACE, item["asin"])
+    if compact:
         # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
-        return "\n".join([
-            opener(pct, title) + f" — {fmt(price)} بدل {fmt(old)}",
+        return "\n".join(
+            [
+                head,
+                f"{pb.fmt(item['price'])} بدل {pb.fmt(item['old'])}",
+                "",
+            ] + coupon_lines(item) + [
+                "🛒 اشتري من هنا:",
+                link,
+                "",
+            ] + footer_lines()
+        )
+    return "\n".join(
+        [
+            head,
             "",
-        ] + cl + ["🛒 اشتري من هنا:", link, ""] + FOOTER_LINES)
-    lines = [opener(pct, title), "", f"<b>{html.escape(short_title(title))}</b>", ""]
-    if price:
-        lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
-        if old:
-            pct = round((old - price) / old * 100)
-            lines.append(f"🏷️ كان: <s>{fmt(old)}</s> (خصم {pct}%)")
-    lines += [""] + cl + ["🛒 اشتري من هنا:", link, ""]
-    lines += FOOTER_LINES
-    return "\n".join(lines)
-
-
-_names = {}
-
-
-async def _bot_username(key, token):
-    if _names.get(key):
-        return _names[key]
-    if not token:
-        return None
-    try:
-        from telegram import Bot
-        async with Bot(token) as b:
-            me = await b.get_me()
-        _names[key] = me.username
-        return me.username
-    except Exception as e:
-        log.warning("username lookup failed (%s): %s", key, type(e).__name__)
-        return None
-
-
-async def channel_kb():
-    """أزرار تحت كل بوست في القناة: تتبع السعر + البحث، وتحتهم أكواد الخصم."""
-    row = []
-    tracker = await _bot_username("tracker", os.environ.get("BOT_TOKEN", ""))
-    if tracker:
-        row.append(InlineKeyboardButton("📉 تتبع سعر أي منتج", url=f"https://t.me/{tracker}"))
-    row.append(InlineKeyboardButton("🔎 ابحث عن أي منتج", url="https://t.me/Mix_Compare_bot"))
-    rows = [row]
-    coupons = await _bot_username("coupons", os.environ.get("COUPON_BOT_TOKEN", ""))
-    if coupons:
-        rows.append([InlineKeyboardButton("🎟️ أكواد الخصم", url=f"https://t.me/{coupons}")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def send_post(bot, chat_id, image, post, markup=None):
-    post = post.rstrip()
-    if markup is None and chat_id == CHANNEL:
-        markup = await channel_kb()
-    if image and len(post) <= 1000:
-        await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML, reply_markup=markup)
-        return
-    if image:
-        await bot.send_photo(chat_id, photo=image)
-    await bot.send_message(
-        chat_id,
-        post,
-        parse_mode=ParseMode.HTML,
-        reply_markup=markup,
-        disable_web_page_preview=True,
+            f"<b>{html.escape(pb.short_title(item['title']))}</b>",
+            "",
+            f"💰 السعر: <b>{pb.fmt(item['price'])}</b>",
+            f"🏷️ كان: <s>{pb.fmt(item['old'])}</s> (خصم {item['pct']}%)",
+            "",
+        ] + coupon_lines(item) + [
+            "🛒 اشتري من هنا:",
+            link,
+            "",
+        ] + footer_lines()
     )
 
 
-# ---------------------------------------------------------------- product pipeline
-def resolve(url, headers):
-    """Follow redirects by hand; tolerate non-http redirect targets."""
-    cur = url
-    body = ""
-    for _ in range(10):
-        r = requests.get(cur, headers=headers, timeout=25, allow_redirects=False)
-        body = r.text or ""
-        loc = r.headers.get("Location")
-        if r.status_code in (301, 302, 303, 307, 308) and loc:
-            nxt = urljoin(cur, loc)
-            if not nxt.lower().startswith(("http://", "https://")):
-                m = re.search(r"https?://[^\s\"']+", unquote(loc))
-                if not m:
-                    return cur, body
-                nxt = m.group(0)
-            cur = nxt
-            continue
-        break
-    return cur, body
+def scan_once():
+    """جولة فحص واحدة. يرجع قايمة (item, post_html, image_bytes)."""
+    now = time.time()
+    if now < _state["pause_until"]:
+        note(f"scan paused for {int(_state['pause_until'] - now)}s (rate limit)")
+        return []
+    used_today = requests_today()
+    if used_today >= DAILY_REQUESTS:
+        note(f"scan skipped: daily API requests {used_today} reached {DAILY_REQUESTS}")
+        return []
+    sent = load_sent()
+    left = quota_left(sent)
+    if left <= 0:
+        h, d = quota_counts(sent)
+        note(f"scan skipped: cap reached (last hour {h}/{HOURLY_CAP}, last 24h {d}/{DAILY_CAP})")
+        return []
 
-
-def process_link(url):
-    """Blocking. Returns (ok, data_or_message)."""
-    debug = []
-    final, body, asin = url, "", None
-    for headers in HEADER_STRATEGIES:
-        try:
-            final, body = resolve(url, headers)
-        except Exception as e:
-            debug.append(f"فتح الرابط: {type(e).__name__}")
-            continue
-        asin = find_asin(final) or find_asin(url) or find_asin(body)
-        if asin:
+    pool = random.sample(KEYWORDS, len(KEYWORDS))
+    found = {}
+    used = raw = skipped = lowq = 0
+    errors = []
+    stop = False
+    for batch in range(MAX_BATCHES):
+        kws = pool[batch * KEYWORDS_PER_ROUND:(batch + 1) * KEYWORDS_PER_ROUND]
+        for kw in kws:
+            used += 1
+            try:
+                data = search(kw, random.choice([1, 1, 2, 2, 3, 3, 4, 5, 6, 7]))
+            except RateLimited as e:
+                _state["pause_until"] = time.time() + RATE_PAUSE
+                note(f"RATE LIMITED (429) -> pause {RATE_PAUSE // 60} min: {e}")
+                stop = True
+                break
+            except Exception as e:
+                errors.append(f"{kw}: {str(e)[:120]}")
+                log.warning("search '%s' failed: %s", kw, e)
+                time.sleep(3)
+                continue
+            for it in parse_items(data):
+                raw += 1
+                if not is_good(it):
+                    lowq += 1
+                elif is_new(sent, it):
+                    found.setdefault(it["asin"], it)
+                else:
+                    skipped += 1
+            time.sleep(2)
+        if stop or len(found) >= max(5, MAX_PER_ROUND * 3):
             break
-    if not asin:
-        return False, "معرفتش أوصل لصفحة المنتج من الرابط ده.\n" + "\n".join(debug)
 
-    host = urlparse(final).netloc.lower()
-    if "amazon." not in host or host.startswith("link."):
-        host = "www.amazon.eg"
-
-    target = f"https://{host}/dp/{asin}"
-    final_url, page = get_page(target, debug)
-    if not page:
-        return False, "أمازون مردتش على البوت.\n" + "\n".join(debug)
-
-    title, price, old, rating, img = read_product(page)
-    log.info("parsed title=%s price=%s old=%s rating=%s img=%s", bool(title), price, old, rating, bool(img))
-    if not title:
-        return False, "الصفحة اتفتحت بس معرفتش أقرا اسم المنتج.\n" + "\n".join(debug)
-
-    link = affiliate(host, asin)
-    raw = download_image(img)
-    try:
-        import deals_scanner
-        coupon = deals_scanner.extract_coupon(page, asin)
-    except Exception:
-        coupon = None
-    card = product_card(title, price, old, raw, {"rating": rating, "coupon": coupon})
-    image = card or (prepare_image(raw) if raw else None)
-    post = build_post(title, price, old, rating, link, compact=COMPACT_POST and bool(card), coupon=coupon)
-    return True, {"image": image, "post": post, "price": price, "title": title, "old": old, "rating": rating,
-                  "link": link, "asin": asin, "host": host, "coupon": coupon}
-
-
-# ---------------------------------------------------------------- handlers
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if OWNER_ID == 0:
-        await update.message.reply_text(f"رقمك (ID): {user.id}\nحطه في OWNER_ID وشغل البوت تاني.")
-        return
-    if is_allowed(user.id):
-        await update.message.reply_text("أهلاً! ابعتلي لينك منتج من أمازون وأنا أجهزلك البوست 🛒\n📸 أو ابعت لقطة شاشة للمنتج ومعاها اللينك، وأنا أحط عليها مستطيلات السعر والكوبونات وشريط القناة.")
-        return
-    await update.message.reply_text("طلبك اتبعت للمسؤول، استنى الموافقة ✋")
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✅ قبول", callback_data=f"ap:{user.id}"),
-            InlineKeyboardButton("❌ رفض", callback_data=f"dn:{user.id}"),
-        ]]
-    )
-    name = user.full_name or "مستخدم"
-    uname = f"@{user.username}" if user.username else "بدون يوزر"
-    try:
-        await context.bot.send_message(
-            OWNER_ID, f"طلب استخدام جديد:\n{name} ({uname})\nID: {user.id}", reply_markup=kb
-        )
-    except Exception as e:
-        log.warning("notify owner failed: %s", e)
-
-
-async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    if not ALLOWED:
-        await update.message.reply_text("مفيش مستخدمين مضافين.")
-        return
-    await update.message.reply_text("\n".join(f"{n} — {i}" for i, n in ALLOWED.items()))
-
-
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    if not context.args:
-        await update.message.reply_text("اكتب: /remove ID")
-        return
-    if ALLOWED.pop(context.args[0], None) is not None:
-        save_users(ALLOWED)
-        await update.message.reply_text("تم الحذف ✅")
-    else:
-        await update.message.reply_text("الرقم ده مش في القائمة.")
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_allowed(user.id):
-        await update.message.reply_text("مش مسموحلك تستخدم البوت. ابعت /start عشان تطلب الإذن.")
-        return
-    editing = context.bot_data.setdefault("editing", {})
-    if user.id in editing:
-        pid = editing.pop(user.id)
-        txt = (update.message.text or "").strip()
-        item = load_draft(pid)
-        if not item:
-            await update.message.reply_text("البوست ده انتهى.")
-            return
-        if txt in ("إلغاء", "الغاء"):
-            await update.message.reply_text("اتلغى التعديل. البوست القديم لسه موجود.")
-            return
-        post = html.escape(txt)
-        store_draft(pid, item["uid"], item["image"], post, item.get("src"))
-        await send_post(context.bot, update.effective_chat.id, item["image"], post, make_kb(pid))
-        return
-    m = re.search(r"https?://\S+", update.message.text or "")
-    pend = context.bot_data.setdefault("pending_shot", {})
-    if m and user.id in pend:
-        raw = pend.pop(user.id)
-        await _finish_shot(update, context, raw, m.group(0).rstrip(").,"))
-        return
-    if not m:
-        await update.message.reply_text("ابعتلي لينك المنتج من أمازون 🔗")
-        return
-    wait = await update.message.reply_text("⏳ بقرا بيانات المنتج...")
-    try:
-        ok, res = await asyncio.to_thread(process_link, m.group(0).rstrip(").,"))
-    except Exception as e:
-        log.exception("process_link crashed")
-        ok, res = False, f"حصل خطأ غير متوقع: {type(e).__name__}"
-    try:
-        await wait.delete()
-    except Exception:
-        pass
-    if not ok:
-        await update.message.reply_text("❌ " + res)
-        return
-    pid = new_pid()
-    store_draft(pid, user.id, res["image"], res["post"])
-    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
-
-
-def _pct_of(price, old):
-    if price and old and old > price:
-        return int(round((old - price) / old * 100))
-    return None
-
-
-def _make_shot_draft(raw, url):
-    """Blocking. لقطة الشاشة + لينك المنتج -> (صورة، بوست). لو صفحة المنتج مقرتش بيطلع بوست بسيط باللينك والفوتر."""
-    import shot_card
-    ok, res = process_link(url)
-    if ok:
-        price, old = res["price"], res["old"]
-        img, info = shot_card.make_shot(raw, price=price, pct=_pct_of(price, old))
-        post = build_post(res["title"], price, old, res["rating"], res["link"], compact=bool(_pct_of(price, old)),
-                          coupon=res.get("coupon"))
-        return True, {"image": img, "post": post, "info": info}
-    asin = find_asin(url)
-    if not asin:
-        return False, res
-    host = urlparse(url).netloc.lower()
-    host = host if ("amazon." in host and not host.startswith("link.")) else "www.amazon.eg"
-    img, info = shot_card.make_shot(raw)
-    post = "\n".join([opener(None, ""), "", "🛒 اشتري من هنا:", affiliate(host, asin), ""] + FOOTER_LINES)
-    return True, {"image": img, "post": post, "info": info}
-
-
-async def _finish_shot(update, context, raw, url):
-    user = update.effective_user
-    wait = await update.effective_message.reply_text("⏳ بجهز اللقطة...")
-    try:
-        ok, res = await asyncio.to_thread(_make_shot_draft, raw, url)
-    except Exception as e:
-        log.exception("shot failed")
-        ok, res = False, f"حصل خطأ غير متوقع: {type(e).__name__}"
-    try:
-        await wait.delete()
-    except Exception:
-        pass
-    if not ok:
-        await update.effective_message.reply_text("❌ " + str(res))
-        return
-    pid = new_pid()
-    store_draft(pid, user.id, res["image"], res["post"])
-    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
-    info = res["info"]
-    if not info.get("price") and not info.get("coupons"):
-        await update.effective_message.reply_text(
-            "ℹ️ مقدرتش أحدد مكان السعر والكوبونات في اللقطة فنزلت من غير مستطيلات "
-            "(لو مش مثبّت tesseract على Termux اكتب: pkg install tesseract)."
-        )
-
-
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """لقطة شاشة لصفحة المنتج: لو مكتوب معاها لينك بيجهّز المسودة، وإلا بيستنى اللينك."""
-    user = update.effective_user
-    msg = update.effective_message
-    if not is_allowed(user.id):
-        await msg.reply_text("مش مسموحلك تستخدم البوت. ابعت /start عشان تطلب الإذن.")
-        return
-    try:
-        if msg.photo:
-            f = await msg.photo[-1].get_file()
-        else:
-            f = await msg.document.get_file()
-        raw = bytes(await f.download_as_bytearray())
-    except Exception as e:
-        await msg.reply_text(f"معرفتش أنزّل الصورة: {type(e).__name__}")
-        return
-    m = re.search(r"https?://\S+", msg.caption or "")
-    if m:
-        await _finish_shot(update, context, raw, m.group(0).rstrip(").,"))
-        return
-    context.bot_data.setdefault("pending_shot", {})[user.id] = raw
-    await msg.reply_text("📸 استلمت اللقطة. ابعتلي دلوقتي لينك المنتج من أمازون.")
-
-
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    action, _, val = (q.data or "").partition(":")
-    uid = q.from_user.id
-
-    if action in ("ap", "dn"):
-        if uid != OWNER_ID:
-            return
-        if action == "ap":
-            ALLOWED[val] = q.message.text.split("\n")[1] if q.message and q.message.text else val
-            save_users(ALLOWED)
-            await q.edit_message_text(f"تم قبول المستخدم {val} ✅")
+    ranked = sorted(found.values(), key=deal_score, reverse=True)
+    weak = sum(1 for x in ranked if deal_score(x) < MIN_SCORE)
+    ranked = [x for x in ranked if deal_score(x) >= MIN_SCORE]
+    best = ranked[:min(MAX_PER_ROUND, left)]
+    results = []
+    coupons = 0
+    for it in best:
+        it["coupon"] = fetch_coupon(it["asin"])
+        if it["coupon"]:
             try:
-                await context.bot.send_message(int(val), "اتقبلت ✅ ابعتلي لينك منتج أمازون.")
+                import coupon_store
+                coupon_store.record_clip(it["asin"], it.get("title"), it["coupon"], it.get("price"))
             except Exception:
                 pass
-        else:
-            await q.edit_message_text(f"تم رفض المستخدم {val} ❌")
-            try:
-                await context.bot.send_message(int(val), "للأسف الطلب اترفض.")
-            except Exception:
-                pass
-        return
-
-    async def say(text, **kw):
-        try:
-            await context.bot.send_message(uid, text, **kw)
-        except Exception as e:
-            log.warning("say failed: %s", type(e).__name__)
-
-    item = load_draft(val)
-    if not item:
-        await say("البوست ده انتهى، ابعت اللينك تاني.")
-        return
-    if uid != item["uid"] and uid != OWNER_ID:
-        return
-
-    if action == "cx":
-        await clear_src(context.bot, item)
-        drop_draft(val)
-        await say("اتلغى ❌")
-        return
-
-    if action == "ed":
-        context.bot_data.setdefault("editing", {})[uid] = val
-        await say(plain(item["post"]), disable_web_page_preview=True)
-        await say("✏️ انسخ النص اللي فوق، عدّل عليه، وابعته هنا.\nعشان تلغي التعديل ابعت: إلغاء")
-        return
-
-    if action == "pub":
-        try:
-            await send_post(context.bot, CHANNEL, item["image"], item["post"])
-        except Exception as e:
-            log.exception("publish failed")
-            await say(f"معرفتش أنشر: {type(e).__name__}\nتأكد إن البوت أدمن في القناة.")
-            return
-        await clear_src(context.bot, item)
-        drop_draft(val)
-        await say("اتنشر في القناة ✅")
-
-
-async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    log.warning("handler error: %s", type(context.error).__name__)
-
-
-def main():
-    if not TOKEN:
-        print("POST_BOT_TOKEN مش موجود. اعمل export الأول.")
-        return
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    app = (
-        Application.builder()
-        .token(TOKEN)
-        .concurrent_updates(True)
-        .connect_timeout(20)
-        .read_timeout(40)
-        .write_timeout(60)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("users", cmd_users))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_error_handler(on_error)
-    print("Bot is running...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+        coupons += 1 if it["coupon"] else 0
+        image = None
+        card = False
+        if it["image"]:
+            raw_img = pb.download_image(it["image"])
+            if raw_img:
+                image = deal_card.make_card(it, raw_img)
+                card = bool(image)
+                if not image:
+                    image = pb.prepare_image(raw_img)
+        results.append((it, build_deal_post(it, compact=COMPACT_POST and card), image))
+        sent[it["asin"]] = {"price": it["price"], "ts": time.time(), "q": 1}
+    save_sent(sent)
+    msg = (f"scan: pool={len(KEYWORDS)} keywords={used} items={raw} low_quality={lowq} already_sent={skipped} "
+           f"good_new={len(found)} weak_score={weak} sent={len(results)} coupons={coupons} api_today={requests_today()} errors={len(errors)}")
+    if errors:
+        msg += " | " + " || ".join(errors[:3])
+    log.info(msg)
+    note(msg)
+    return results
