@@ -606,16 +606,22 @@ async def send_post(bot, chat_id, image, post, markup=None):
         markup = await channel_kb()
     if image and len(post) <= 1000:
         await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML, reply_markup=markup)
-        return
-    if image:
-        await bot.send_photo(chat_id, photo=image)
-    await bot.send_message(
-        chat_id,
-        post,
-        parse_mode=ParseMode.HTML,
-        reply_markup=markup,
-        disable_web_page_preview=True,
-    )
+    else:
+        if image:
+            await bot.send_photo(chat_id, photo=image)
+        await bot.send_message(
+            chat_id,
+            post,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    if chat_id == CHANNEL:
+        try:
+            import repost_store
+            repost_store.record(image, post)     # لبوت إعادة النشر
+        except Exception as e:
+            log.warning("repost record skipped: %s", type(e).__name__)
 
 
 # ---------------------------------------------------------------- product pipeline
