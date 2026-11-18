@@ -1,479 +1,950 @@
-"""لقطة شاشة صفحة المنتج + مستطيلات على السعر والكوبونات + شريط القناة (لوجو + اسم القناة + اللينك).
-
-- البحث عن أماكن السعر والكوبونات بيتم بقراءة النص من الصورة (tesseract). لو tesseract مش موجود أو معرفش يلاقي حاجة،
-  بيتحط الشريط بس من غير مستطيلات (مفيش خطأ).
-- على Termux:  pkg install tesseract
-"""
-import io
 import os
 import re
-import shutil
-import subprocess
-import tempfile
+import io
+import json
+import html
+import random
+import string
+import asyncio
 import logging
+from urllib.parse import urlparse, urljoin, unquote
 
-from PIL import Image, ImageDraw
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
-import deal_card as dc
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+for _n in ("httpx", "httpcore", "telegram", "apscheduler", "urllib3"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
+log = logging.getLogger("post_bot")
 
-log = logging.getLogger("shot_card")
+TOKEN = os.environ.get("POST_BOT_TOKEN", "")
+try:
+    OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+except ValueError:
+    OWNER_ID = 0
 
-MAX_W = 1080
-SCALE = 2                      # بنكبّر الصورة قبل القراءة عشان الأرقام الصغيرة تتقري صح
-PRICE_LINE = (220, 20, 60)      # أحمر
-PRICE_FILL = (255, 214, 0, 70)  # أصفر شفاف
-COUPON_LINE = (22, 150, 70)     # أخضر
-COUPON_FILL = (60, 200, 90, 55)
-CODE_RE = re.compile(r"^[A-Z][A-Z0-9]*\d{2,}$")
-BANNER_H_RATIO = 100 / 1200.0   # ارتفاع الشريط نسبة للعرض (زي كروت العروض)
+CHANNEL = "@PromoCodeOnlain"
+MY_TAG = "mixdeals-21"
+CHANNEL_LINK = "https://t.me/PromoCodeOnlain"
+SEARCH_BOT_LINK = "https://t.me/Mix_Compare_bot"
+BOT_LINE = []  # (قديم) السطر بقى جوه FOOTER_LINES
+FOOTER_LINES = []  # الأزرار تحت البوست بتغني عن السطور
+BASE = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.path.join(BASE, "allowed_users.json")
+LOGO_FILE = os.path.join(BASE, "logo.png")
 
+CANVAS = 1080
+PRODUCT_BOX = 0.80
+LOGO_RATIO = 0.16
 
-def _ocr_words(img, scale=None):
-    """يرجع قايمة كلمات [{t,l,t,w,h,conf}] بإحداثيات الصورة الأصلية. [] لو tesseract مش متاح."""
-    exe = shutil.which("tesseract")
-    if not exe:
-        return []
-    scale = scale or SCALE
-    big = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "in.png")
-        big.save(p)
-        try:
-            r = subprocess.run([exe, p, "stdout", "-l", "eng", "--psm", "11", "tsv"],
-                               capture_output=True, text=True, timeout=60)
-        except Exception as e:
-            log.warning("ocr failed: %s %s", type(e).__name__, str(e)[:150])
-            return []
-    if r.returncode != 0 or not r.stdout.strip():
-        log.warning("ocr empty: rc=%s err=%s", r.returncode, (r.stderr or "")[:200].replace("\n", " "))
-    words = []
-    for line in r.stdout.splitlines()[1:]:
-        c = line.split("\t")
-        if len(c) < 12 or not c[11].strip():
-            continue
-        try:
-            conf = float(c[10])
-        except ValueError:
-            continue
-        if conf < 25:
-            continue
-        words.append({
-            "t": c[11].strip(),
-            "l": int(c[6]) / scale, "tp": int(c[7]) / scale,
-            "w": int(c[8]) / scale, "h": int(c[9]) / scale,
-            "conf": conf,
-        })
-    return words
+OPENERS = [   # قديمة (احتياطي لو مفيش خصم ولا اسم منتج)
+    "🔥 شوف العرض ده!",
+    "⚡ متفوتش العرض ده!",
+    "🛍️ من عروض اليوم",
+    "✅ متاح حاليًا",
+]
 
 
-def _digits(s):
-    return re.sub(r"[^0-9,]", "", s)
+def short_name(title, words=4, limit=34):
+    """اسم المنتج المختصر (أول كام كلمة) للجُمل اللي بتبدأ بيها البوستات."""
+    t = re.sub(r"\s+", " ", re.sub(r"[\(\[\|\-–—،,].*$", "", title or "")).strip()
+    t = " ".join(t.split()[:words])
+    return t[:limit].strip()
 
 
-PCT_RE = re.compile(r"^-?(\d{1,2})%-?$")
+def opener(pct=None, title="", hot=False):
+    """سطر بداية البوست: بيتنوع بين الصياغات (خصم بالنسبة / عرض ممتاز على / توفير حقيقي / عروض اليوم...)."""
+    name = short_name(title)
+    pool = [
+        "🛍️ من عروض اليوم",
+        "👀 شوف العرض ده",
+        "⏳ الحق العرض ده قبل ما يخلص",
+        "✅ متاح حاليًا",
+        "🔥 متفوتش العرض ده",
+    ]
+    if pct and pct >= 5:
+        pool += [f"🔥 عرض بخصم {pct}%", f"💰 عرض توفير حقيقي — خصم {pct}%", f"🏷️ خصم {pct}% دلوقتي"]
+        if pct >= 50 or hot:
+            pool += [f"🚨 عرض ممتاز — خصم {pct}%", "⏳ الحق العرض ده قبل ما يخلص"]
+    if name and pct and pct >= 20:
+        pool += [f"⭐ عرض ممتاز على {name}", f"💥 عرض توفير حقيقي على {name}"]
+    return random.choice(pool)
 
 
-def find_price_box_by_pct(words, price, pct, top_limit):
-    """لو الرقم نفسه اتقرا غلط (أرقام صغيرة): بنستخدم نسبة الخصم (-17%) كمرساة ونحسب مكان السعر على يسارها."""
-    cands = []
-    for w in words:
-        m = PCT_RE.match(w["t"].replace("“", "").replace("”", ""))
-        if not m or w["tp"] < top_limit:
-            continue
-        v = int(m.group(1))
-        if not 3 <= v <= 90:
-            continue
-        if pct and abs(v - pct) > 1:
-            continue
-        cands.append(w)
-    if not cands:
+CLOSERS = [
+    "⏳ الكمية والسعر ممكن يتغيروا في أي وقت.",
+    "👌 اطلبه قبل ما يخلص.",
+    "🚚 تأكد من السعر النهائي قبل الشراء.",
+    "✅ شوف التفاصيل من الرابط.",
+]
+
+UA_CHROME = (
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+)
+UA_DESKTOP = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+UA_BOT = "Mozilla/5.0 (compatible; TelegramBot/1.0; +https://telegram.org)"
+
+HEADER_STRATEGIES = [
+    {"User-Agent": UA_CHROME},
+    {
+        "User-Agent": UA_DESKTOP,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ar-EG,ar;q=0.9,en;q=0.8",
+    },
+    {"User-Agent": UA_BOT},
+]
+
+AMAZON_HOSTS = ("amazon.", "amzn.", "a.co", "link.amazon")
+
+
+# ---------------------------------------------------------------- users
+def load_users():
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_users(data):
+    try:
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception as e:
+        log.warning("save_users failed: %s", e)
+
+
+ALLOWED = load_users()
+
+DRAFTS = os.path.join(BASE, "drafts")
+PID_RE = re.compile(r"[a-z0-9]{8}")
+
+
+def new_pid():
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+
+
+def _dpath(pid, ext):
+    return os.path.join(DRAFTS, f"{pid}.{ext}")
+
+
+def store_draft(pid, uid, image, post, src=None):
+    os.makedirs(DRAFTS, exist_ok=True)
+    with open(_dpath(pid, "json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {"uid": uid, "post": post, "image": bool(image), "src": src or []},
+            f,
+            ensure_ascii=False,
+        )
+    if image:
+        with open(_dpath(pid, "jpg"), "wb") as f:
+            f.write(image)
+
+
+def load_draft(pid):
+    if not PID_RE.fullmatch(pid or ""):
         return None
-    a = min(cands, key=lambda w: w["tp"])        # أعلى واحدة = نسبة خصم المنتج (الكوبونات تحتها)
-    n = len(f"{int(price):,}") if price else 4
-    h = a["h"]
-    x0 = a["l"] - (n * 0.62 * 1.15 * h + 3.6 * h + 8)
-    return [x0, a["tp"] - 0.4 * h, a["l"] + a["w"] + 8, a["tp"] + 2.7 * h]
+    try:
+        with open(_dpath(pid, "json"), "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    img = None
+    if d.get("image"):
+        try:
+            with open(_dpath(pid, "jpg"), "rb") as f:
+                img = f.read()
+        except Exception:
+            img = None
+    d["image"] = img
+    return d
 
 
-def price_candidates_by_color(im, price, top_limit):
-    """آخر حل: نسبة الخصم "-17%" مكتوبة بالأحمر (كلام رفيع مش مربع متملي). بنلاقيها من لونها ونحسب مكان السعر على يسارها."""
-    from PIL import ImageChops
-    r, g, b = im.split()
-    # أحمر/وردي غامق (حتى الحواف الناعمة للخط): R عالي وأعلى من G بكتير ومن B شوية
-    m = ImageChops.multiply(ImageChops.multiply(r.point(lambda x: 255 if x > 120 else 0),
-                                                ImageChops.subtract(r, g).point(lambda x: 255 if x > 60 else 0)),
-                            ImageChops.subtract(r, b).point(lambda x: 255 if x > 30 else 0))
-    raw, W = m.tobytes(), im.width
-    start = None
-    out = []
-    for y in range(int(top_limit), im.height + 1):
-        on = y < im.height and raw[y * W:(y + 1) * W].count(255) >= 3
-        if on and start is None:
-            start = y
-        elif not on and start is not None:
-            t, bt = start, y
-            start = None
-            if not 12 <= bt - t <= 42:
-                continue
-            sub = m.crop((0, t, W, bt))
-            sb, bh = sub.tobytes(), bt - t
-            cols = [x for x in range(W) if any(sb[yy * W + x] for yy in range(bh))]
-            if not cols:
-                continue
-            # نقسّم الأعمدة الحمرا لتجمعات (بينهم فراغ) عشان صور المنتج الحمرا على اليمين متلخبطش
-            groups, gs, gp = [], cols[0], cols[0]
-            for x in cols[1:]:
-                if x - gp > 14:
-                    groups.append((gs, gp + 1))
-                    gs = x
-                gp = x
-            groups.append((gs, gp + 1))
-            for gx0, gx1 in groups:
-                bw = gx1 - gx0
-                if not 22 <= bw <= 100:
-                    continue
-                part = sub.crop((gx0, 0, gx1, bh))
-                bb = part.getbbox()
-                if not bb:
-                    continue
-                th = bb[3] - bb[1]
-                fill = part.tobytes().count(255) / max(1, bw * th)
-                if th < 10 or fill >= 0.5:
-                    continue
-                n = len(f"{int(price):,}") if price else 4
-                tt = t + bb[1]
-                x0 = gx0 - (n * 0.62 * 1.15 * th + 3.6 * th + 8)   # الأرقام + الكسور الصغيرة + كلمة جنيه
-                out.append([x0, tt - 0.4 * th, gx1 + 8, tt + 2.7 * th])
-    return out
+def set_src(pid, src):
+    """يحفظ أماكن رسايل المسودة في قناة المسودات عشان تتمسح بعد النشر."""
+    d = load_draft(pid)
+    if d:
+        store_draft(pid, d["uid"], d["image"], d["post"], src)
 
 
-def _crop_has_price(im, box, price):
-    """نقص مستطيل السعر ونقراه تاني بتكبير كبير: لو فيه أرقام السعر يبقى هو."""
-    exe = shutil.which("tesseract")
-    if not exe or not price:
-        return False
-    x0, y0, x1, y1 = [int(v) for v in _clamp(box, im)]
-    if x1 - x0 < 20 or y1 - y0 < 10:
-        return False
-    crop0 = im.crop((x0, y0, x1, y1))
-    want = str(int(price))
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "c.png")
-        for scale in (3, 4, 6):
-            crop0.resize((crop0.width * scale, crop0.height * scale), Image.LANCZOS).save(p)
-            for psm in ("6", "11"):
-                try:
-                    r = subprocess.run([exe, p, "stdout", "-l", "eng", "--psm", psm], capture_output=True, text=True, timeout=30)
-                except Exception:
-                    return False
-                if want in re.sub(r"\D", "", r.stdout):
-                    return True
+async def clear_src(bot, item):
+    for chat, mid in item.get("src") or []:
+        try:
+            await bot.delete_message(chat, mid)
+        except Exception:
+            pass
+
+
+def drop_draft(pid):
+    if not PID_RE.fullmatch(pid or ""):
+        return
+    for ext in ("json", "jpg"):
+        try:
+            os.remove(_dpath(pid, ext))
+        except OSError:
+            pass
+
+
+def plain(post):
+    return html.unescape(re.sub(r"<[^>]+>", "", post))
+
+
+def make_kb(pid):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ نشر", callback_data=f"pub:{pid}"),
+                InlineKeyboardButton("✏️ تعديل", callback_data=f"ed:{pid}"),
+            ],
+            [InlineKeyboardButton("❌ إلغاء", callback_data=f"cx:{pid}")],
+        ]
+    )
+
+
+def is_allowed(uid):
+    return uid == OWNER_ID or str(uid) in ALLOWED
+
+
+# ---------------------------------------------------------------- helpers
+AR_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩٬٫", "0123456789,.")
+
+
+def parse_price(text):
+    if not text:
+        return None
+    t = text.translate(AR_DIGITS)
+    m = re.search(r"\d[\d,]*\.?\d*", t)
+    if not m:
+        return None
+    num = m.group(0).replace(",", "")
+    try:
+        v = float(num)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+def fmt(v):
+    if v == int(v):
+        return f"{int(v):,} جنيه"
+    return f"{v:,.2f} جنيه"
+
+
+def first_text(soup, selectors):
+    for sel in selectors:
+        for el in soup.select(sel):
+            t = el.get_text(" ", strip=True)
+            if t:
+                return t
+    return ""
+
+
+def find_asin(text):
+    if not text:
+        return None
+    m = re.search(r"/(?:dp|gp/product|gp/aw/d|product)/([A-Z0-9]{10})", text)
+    return m.group(1) if m else None
+
+
+def affiliate(host, asin):
+    return f"https://{host}/dp/{asin}?tag={MY_TAG}"
+
+
+def is_amazon_host(host):
+    host = (host or "").lower()
+    return any(p in host for p in AMAZON_HOSTS)
+
+
+def get_page(url, debug):
+    """Try several header strategies. Returns (final_url, html) of the best page."""
+    best = (url, "")
+    for i, headers in enumerate(HEADER_STRATEGIES, 1):
+        try:
+            r = requests.get(url, headers=headers, timeout=25, allow_redirects=True)
+            body = r.text or ""
+            has_title = "productTitle" in body
+            debug.append(f"محاولة {i}: حالة {r.status_code}، طول {len(body)}، عنوان {'✔' if has_title else '✘'}")
+            log.info("fetch try %s status=%s len=%s title=%s", i, r.status_code, len(body), has_title)
+            if len(body) > len(best[1]) or (r.url and not best[1]):
+                best = (r.url, body)
+            if r.status_code == 200 and has_title:
+                return r.url, body
+        except Exception as e:
+            debug.append(f"محاولة {i}: خطأ {type(e).__name__}")
+            log.warning("fetch try %s error: %s", i, e)
+    return best
+
+
+def clean_title(t):
+    t = re.sub(r"\s+", " ", t or "").strip()
+    pat = r"\s*[:：|\-–]?\s*(?:amazon\.[a-z.]+|أمازون)"
+    m = re.search(pat, t, flags=re.I)
+    if m:
+        before = t[: m.start()].strip(" :：|-–")
+        t = before if before else re.sub(pat, " ", t, flags=re.I)
+    t = re.sub(r"amazon", "", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip(" :：|-–")
+
+
+# أقسام الصفحة اللي فيها أسعار منتجات تانية (مقترحات/إعلانات) ومينفعش نقرا منها سعر المنتج
+_BAD_SECTIONS = ("sims", "similar", "sp_detail", "sponsored", "anonCarousel", "bundle", "percolate", "rhf",
+                 "recently", "customer-reviews", "a-carousel")
+_PRICE_ROOTS = (
+    "#corePriceDisplay_desktop_feature_div", "#corePrice_feature_div", "#apex_desktop",
+    "#apex_offerDisplay_desktop", "#desktop_buybox", "#buybox", "#qualifiedBuybox", "#tabular-buybox",
+    "#centerCol", "#ppd",
+)
+
+
+def _price_roots(soup):
+    for sel in _PRICE_ROOTS:
+        root = soup.select_one(sel)
+        if root is not None:
+            yield root
+
+
+def _bad_section(el, root):
+    for a in el.parents:
+        if a is root:
+            break
+        ident = " ".join(filter(None, [a.get("id", ""), " ".join(a.get("class", []) or [])])).lower()
+        if ident and any(b.lower() in ident for b in _BAD_SECTIONS):
+            return True
     return False
 
 
-def find_price_box(words, price, pct=None, top_limit=0, im=None):
-    """مستطيل حوالين السعر. بنجرّب أكتر من طريقة، وأي مستطيل مش مؤكد بنتأكد منه بقراءة المنطقة تاني؛ ولو مفيش مؤكد مفيش مستطيل."""
-    if not price:
-        return None
-    box = _find_price_box_digits(words, price)
-    if box:
-        return box
-    cands = []
-    b = find_price_box_by_pct(words, price, pct, top_limit)
-    if b and pct:
-        return b          # قرينا نفس نسبة الخصم المعروفة من الصفحة (±1): مرساة موثوقة
-    if b:
-        cands.append(b)
-    if im is not None:
-        cands += price_candidates_by_color(im, price, top_limit)[:6]
-    if im is not None:
-        cands += price_candidates_by_digits(words, im, top_limit)
-    for b in cands:
-        if im is None or _crop_has_price(im, b, price):
-            return b
-    if im is not None:
-        return price_box_by_divider(im, top_limit)
+def scoped_price(soup, strike):
+    """سعر المنتج الأساسي (strike=False) أو سعر القائمة المشطوب (strike=True) من صندوق الشراء بس."""
+    for root in _price_roots(soup):
+        if strike:
+            els = root.select("span.a-price.a-text-price, span[data-a-strike='true'], .basisPrice .a-price")
+        else:
+            els = root.select(".a-price:not(.a-text-price)")
+        for el in els:
+            if _bad_section(el, root):
+                continue
+            if not strike and el.get("data-a-strike") == "true":
+                continue
+            off = el.select_one(".a-offscreen")
+            v = parse_price(off.get_text(" ", strip=True)) if off else None
+            if v:
+                return v
     return None
 
 
-def price_box_by_divider(im, top_limit=0):
-    """آخر حل من غير قراءة نصوص: أول سطر كبير بعد الخط الفاصل (تحت "تم شراء ...") هو السعر في صفحات أمازون."""
-    try:
-        W, H = im.size
-        cw = int(W * 0.5)
-        g = im.convert("L").crop((0, 0, cw, H))
-        raw = g.tobytes()
-        # الخط الفاصل: صف رفيع رمادي فاتح ممتد على أغلب العمود من غير حبر غامق
-        div = None
-        for y in range(int(top_limit), H - 4):
-            row = raw[y * cw:(y + 1) * cw]
-            light = sum(1 for p in row if 150 <= p <= 240)
-            dark = sum(1 for p in row if p < 110)
-            if light >= cw * 0.55 and dark <= 6:
-                div = y
+def read_product(page):
+    soup = BeautifulSoup(page, "html.parser")
+
+    title = first_text(soup, ["#productTitle", "span#productTitle", "h1#title span"])
+    if not title:
+        og = soup.find("meta", property="og:title")
+        if og and og.get("content"):
+            title = og["content"]
+    if not title and soup.title and soup.title.string:
+        title = soup.title.string
+    title = clean_title(title)
+
+    price = scoped_price(soup, strike=False)
+    if not price:
+        price = parse_price(first_text(soup, ["#priceblock_ourprice", "#priceblock_dealprice", "#price_inside_buybox"]))
+
+    old = scoped_price(soup, strike=True)
+    if not old:
+        old = parse_price(first_text(soup, ["#listPrice"]))
+    if price and not old:
+        # أمازون كاتبة نسبة الخصم بس: نحسب السعر القديم منها
+        for root in _price_roots(soup):
+            el = root.select_one(".savingPercentage, .savingsPercentage")
+            m = re.search(r"(\d{1,2})\s*%", (el.get_text(" ") if el else "").translate(AR_DIGITS))
+            if m and 3 <= int(m.group(1)) <= 90:
+                old = round(price / (1 - int(m.group(1)) / 100), 2)
                 break
-        if div is None:
-            return None
-        y = div + 3
-        while y < H - 4 and sum(1 for p in raw[y * cw:(y + 1) * cw] if p < 140) < 2:
-            y += 1
-        start = y
-        while y < H and sum(1 for p in raw[y * cw:(y + 1) * cw] if p < 140) >= 2:
-            y += 1
-        top, bot = start, y
-        if not 12 <= bot - top <= 46:
-            return None
-        cols = [x for x in range(cw) if any(raw[yy * cw + x] < 140 for yy in range(top, bot))]
-        if not cols:
-            return None
-        # آخر تجمّع أعمدة على اليمين (السعر) من غير اللي بعيد عنه
-        groups, gs, gp = [], cols[0], cols[0]
-        for x in cols[1:]:
-            if x - gp > 22:
-                groups.append((gs, gp + 1))
-                gs = x
-            gp = x
-        groups.append((gs, gp + 1))
-        x0, x1 = groups[-1]
-        if x1 - x0 < 40:
-            return None
-        return [x0 - 8, top - 5, x1 + 8, bot + 5]
-    except Exception as e:
-        log.warning("divider price failed: %s", type(e).__name__)
-        return None
+    if price and old and old <= price:
+        old = None
+
+    rating = ""
+    el = soup.select_one("#acrPopover")
+    if el and el.get("title"):
+        rating = el["title"]
+    if not rating:
+        rating = first_text(soup, ["span.a-icon-alt"])
+    m = re.search(r"\d[.,٫]?\d*", (rating or "").translate(AR_DIGITS))
+    rating = m.group(0).replace(",", ".") if m else ""
+
+    img = ""
+    tag = soup.select_one("#landingImage") or soup.select_one("#imgBlkFront")
+    if tag:
+        dyn = tag.get("data-a-dynamic-image")
+        if dyn:
+            try:
+                d = json.loads(html.unescape(dyn))
+                img = max(d.items(), key=lambda kv: kv[1][0] * kv[1][1])[0]
+            except Exception:
+                img = ""
+        if not img:
+            img = tag.get("data-old-hires") or tag.get("src") or ""
+    if not img:
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            img = og["content"]
+    if not img:
+        for sel in ("#imgTagWrapperId img", "#main-image", "#ebooksImgBlkFront", "img[data-old-hires]"):
+            t = soup.select_one(sel)
+            if t:
+                img = t.get("data-old-hires") or t.get("src") or ""
+                if img.startswith("http"):
+                    break
+                img = ""
+    if not img:
+        for pat in (r'"hiRes"\s*:\s*"(https:[^"]+)"', r'"large"\s*:\s*"(https:[^"]+)"'):
+            m = re.search(pat, page)
+            if m:
+                img = m.group(1).replace("\\/", "/")
+                break
+    if not img:
+        for m in re.finditer(r"https://m\.media-amazon\.com/images/I/[A-Za-z0-9%+_-]{8,}[^\"'\s\\<>]*?\.(?:jpg|jpeg|png)", page):
+            if "sprite" not in m.group(0) and "pixel" not in m.group(0):
+                img = m.group(0)
+                break
+
+    return title, price, old, rating, img
 
 
-def price_candidates_by_digits(words, im, top_limit, limit=6):
-    """السعر مفيهوش نسبة خصم (منتج بسعر واحد): بنجرّب الأرقام الكبيرة في العمود الشمال (الأكبر خط الأول)،
-    وكل مستطيل بيتأكد منه بقراءة المنطقة تاني."""
-    ws = [w for w in words if re.search(r"\d", w["t"]) and w["h"] >= 16 and w["tp"] >= top_limit
-          and w["l"] < im.width * 0.62]
-    ws.sort(key=lambda w: -w["h"])
-    out = []
-    for w in ws[:limit]:
-        out.append([w["l"] - 2.6 * w["h"] - 6, w["tp"] - 0.35 * w["h"],
-                    w["l"] + w["w"] + 1.5 * w["h"] + 6, w["tp"] + 1.35 * w["h"]])
-    return out
+def full_size(url):
+    return re.sub(r"\._[^/]*?_\.", ".", url) if url else url
 
 
-def _find_price_box_digits(words, price):
-    want = f"{int(price):,}"
-    cands = [w for w in words if _digits(w["t"]) == want or _digits(w["t"]).replace(",", "") == want.replace(",", "")]
-    if not cands:
-        return None
-    # أكبر خط (السعر الأساسي أطول كلمة بارتفاع أكبر)
-    w0 = max(cands, key=lambda w: w["h"])
-    cy = w0["tp"] + w0["h"] / 2
-    cx0 = w0["l"] + w0["w"] / 2
-    row = [w for w in words if abs((w["tp"] + w["h"] / 2) - cy) < w0["h"] * 0.9
-           and abs((w["l"] + w["w"] / 2) - cx0) < w0["w"] * 1.5]     # قريبة بس: "جنيه" و "-11%" من غير صورة المنتج
-    x0 = min(min(w["l"] for w in row), w0["l"] - w0["w"] * 0.45) - 8   # مكان كلمة "جنيه"
-    x1 = max(max(w["l"] + w["w"] for w in row), w0["l"] + w0["w"] * 1.7) + 8   # مكان نسبة الخصم
-    y0 = w0["tp"] - w0["h"] * 0.35
-    y1 = w0["tp"] + w0["h"] * 2.1   # يشمل سطر سعر القائمة تحت السعر
-    return [x0, y0, x1, y1]
-
-
-def _green_bands(im, x_limit, y_from):
-    """شارات الكوبون الخضرا (زي "20%" و"توفير"): بترجّع [(top, bottom)] لكل شارة جوه العمود."""
-    from PIL import ImageChops
-    crop = im.crop((0, 0, max(10, int(x_limit)), im.height))
-    h, s, v = crop.convert("HSV").split()
-    m = ImageChops.multiply(ImageChops.multiply(h.point(lambda x: 255 if 58 <= x <= 100 else 0),
-                                                s.point(lambda x: 255 if x >= 85 else 0)),
-                            v.point(lambda x: 255 if x >= 165 else 0))
-    raw = m.tobytes()
-    W = crop.width
-    min_px = max(14, W // 40)
-    bands, start = [], None
-    for y in range(int(y_from), crop.height):
-        on = raw[y * W:(y + 1) * W].count(255) >= min_px
-        if on and start is None:
-            start = y
-        elif not on and start is not None:
-            if 10 <= y - start <= 48:
-                bands.append((start, y))
-            start = None
-    return bands
-
-
-def _orange_bands(im, x_limit, y_from):
-    """شارة "الكوبون:" البرتقالي: [(top, bottom, left, right)]. النجوم أرفع من كده فبتتفلتر."""
-    from PIL import ImageChops
-    crop = im.crop((0, 0, max(10, int(x_limit)), im.height))
-    h, s, v = crop.convert("HSV").split()
-    m = ImageChops.multiply(ImageChops.multiply(h.point(lambda x: 255 if 12 <= x <= 30 else 0),
-                                                s.point(lambda x: 255 if x >= 140 else 0)),
-                            v.point(lambda x: 255 if x >= 200 else 0))
-    raw, W = m.tobytes(), crop.width
-    min_px = max(12, W // 40)
-    out, start = [], None
-    for y in range(int(y_from), crop.height + 1):
-        on = y < crop.height and raw[y * W:(y + 1) * W].count(255) >= min_px
-        if on and start is None:
-            start = y
-        elif not on and start is not None:
-            if 18 <= y - start <= 48:
-                sub = m.crop((0, start, W, y))
-                bb = sub.getbbox()
-                if bb and 40 <= bb[2] - bb[0] <= 160:
-                    out.append((start, y, bb[0], bb[2]))
-            start = None
-    return out
-
-
-def find_coupon_boxes(words, below_y, im=None, right_edge=None):
-    """مستطيل لكل كوبون. الأساس هو الشارة (البرتقالي "الكوبون:" أو الخضرا)؛ والكود (حروف كبيرة + أرقام) بيوسّع المستطيل لو نزل سطر زيادة."""
-    codes = [w for w in words if CODE_RE.match(w["t"]) and 5 <= len(w["t"]) <= 14 and w["tp"] > below_y]
-    right = max([w["l"] + w["w"] for w in codes] + [right_edge or 0]) + 10
-    if im is not None and right <= 40:
-        right = int(im.width * 0.55)     # مفيش مستطيل سعر: نفترض عرض العمود الشمال
-    if im is not None and right > 40:
-        ob = _orange_bands(im, im.width * 0.62, below_y)
-        if ob:
-            boxes = []
-            for t, bt, l, r in ob:
-                boxes.append([2, t - 8, max(right, r + 14), bt + (bt - t) * 1.0 + 4])   # السطر + "الشروط" تحته
-            # شارات خضرا تحتها ("وفر 5% على 5 سلعة"): مستطيل لكل واحدة، من غير اللي ملمسة الكوبون ولا المقطوعة من آخر الصورة
-            for t, bt in _green_bands(im, right, below_y):
-                if bt >= im.height - 6:
-                    continue
-                if any(t < b[3] and bt > b[1] for b in boxes):
-                    continue
-                boxes.append([2, t - 6, right, bt + (bt - t) * 0.9 + 4])
-            boxes.sort(key=lambda b: b[1])
-            return boxes
-        bands = _green_bands(im, right, below_y)
-        if bands:
-            boxes = []
-            for i, (t, bt) in enumerate(bands):
-                nxt = bands[i + 1][0] - 5 if i + 1 < len(bands) else 10 ** 6
-                top = t - 6
-                bottom = t + (bt - t) * 2.35
-                inside = [w for w in codes if t - 4 <= w["tp"] < nxt]
-                if inside:
-                    bottom = max(bottom, max(w["tp"] + w["h"] for w in inside) + 6)
-                boxes.append([2, top, right, min(bottom, nxt)])
-            return boxes
-    if not codes:
-        return []
-    codes.sort(key=lambda w: w["tp"])
-    uniq = []
-    for w in codes:
-        if uniq and abs(w["tp"] - uniq[-1]["tp"]) < w["h"] * 1.5:
-            if w["conf"] > uniq[-1]["conf"]:
-                uniq[-1] = w
-            continue
-        uniq.append(w)
-    boxes, prev_bottom = [], below_y
-    for w in uniq:
-        top = max(prev_bottom + w["h"] * 0.5, w["tp"] - w["h"] * 2.1)
-        bottom = w["tp"] + w["h"] * 1.5
-        boxes.append([2, top, right, bottom])
-        prev_bottom = bottom
-    return boxes
-
-
-def find_rating_box(words, above_y):
-    """صف التقييم: لازم رقم التقييم (4.2) وعدد المراجعات بين أقواس ((2,449)) على نفس السطر؛ عشان منمسحش أرقام من العنوان."""
-    nums = [w for w in words if re.fullmatch(r"[1-5][.,]\d", w["t"]) and w["tp"] < above_y]
-    counts = [w for w in words if re.fullmatch(r"\(\d[\d,.]*\)?", w["t"]) and w["tp"] < above_y]
-    best = None
-    for n in nums:
-        cy = n["tp"] + n["h"] / 2
-        for c in counts:
-            if abs((c["tp"] + c["h"] / 2) - cy) < n["h"] * 0.8 and abs(c["l"] - n["l"]) < n["w"] * 12:
-                best = (n, c)
-    if not best:
-        return None
-    n, c = best
-    x0 = min(n["l"], c["l"]) - 3
-    x1 = max(n["l"] + n["w"], c["l"] + c["w"]) + 3
-    top = min(n["tp"], c["tp"]) - 4
-    return [x0, top, x1, max(n["tp"] + n["h"], c["tp"] + c["h"]) + 4]
-
-
-def _clamp(box, im):
-    x0, y0, x1, y1 = box
-    return [max(0, int(x0)), max(0, int(y0)), min(im.width - 1, int(x1)), min(im.height - 1, int(y1))]
-
-
-def _banner(card, bh):
-    """شريط القناة بنفس شكل كروت العروض (نسبة للعرض): لوجو + اسم القناة + اللينك."""
-    W, H = card.size
-    k = W / 1200.0
-    d = ImageDraw.Draw(card)
-    d.rectangle([0, H - bh, W, H], fill=dc.NAVY)
-    right = W - int(40 * k)
-    mid = H - bh // 2
-    if os.path.exists(dc.LOGO_FILE):
+def fetch_bytes(url):
+    for headers in ({"User-Agent": UA_CHROME}, {"User-Agent": UA_DESKTOP}):
         try:
-            lg = Image.open(dc.LOGO_FILE).convert("RGBA")
-            dia = int(80 * k)
-            lg.thumbnail((dia - int(6 * k), dia - int(6 * k)), Image.LANCZOS)
-            d.ellipse([right - dia, mid - dia // 2, right, mid + dia // 2], fill=dc.WHITE)
-            card.paste(lg, (right - dia + (dia - lg.width) // 2, mid - lg.height // 2), lg)
-            right -= dia + int(18 * k)
+            r = requests.get(url, headers=headers, timeout=25)
+            if r.status_code == 200 and len(r.content) > 1000:
+                return r.content
         except Exception:
             pass
-    bf = dc.font(max(14, int(42 * k)))
-    bw = int(dc.width(d, dc.BRAND, bf)) + int(56 * k)
-    ph = int(68 * k)
-    d.rounded_rectangle([right - bw, mid - ph // 2, right, mid + ph // 2], radius=int(18 * k), fill=dc.YELLOW)
-    dc.draw_text(d, (right - bw // 2, mid), dc.BRAND, bf, dc.NAVY, "mm")
-    d.text((int(40 * k), mid), dc.LINK, font=dc.font(max(12, int(34 * k))), fill=dc.WHITE, anchor="lm")
+    return None
 
 
-def make_shot(raw, price=None, pct=None, crop_top=0, crop_bottom=0):
-    """raw: بايتات لقطة الشاشة. يرجع (JPEG بايتات, {"price": bool, "coupons": عدد, "rating_hidden": bool})."""
-    im = Image.open(io.BytesIO(raw)).convert("RGB")
-    if crop_top or crop_bottom:
-        im = im.crop((0, crop_top, im.width, im.height - crop_bottom))
-    if im.width > MAX_W:
-        im = im.resize((MAX_W, int(im.height * MAX_W / im.width)), Image.LANCZOS)
-    info = {"price": False, "coupons": 0, "rating_hidden": False}
+def download_image(url):
+    if not url:
+        return None
+    data = fetch_bytes(full_size(url))
+    if not data:
+        data = fetch_bytes(url)
+    return data
+
+
+def prepare_image(data):
     try:
-        import time as _t
-        _t0 = _t.time()
-        words = _ocr_words(im)
-        log.warning("shot: size=%sx%s words=%d ocr=%.1fs price=%s pct=%s", im.width, im.height, len(words),
-                    _t.time() - _t0, price, pct)
-        pbox = find_price_box(words, price, pct, im.height * 0.12, im)
-        if not pbox and price:
-            # قراءة تانية للعمود الشمال لوحده بتكبير مختلف (الأرقام الكبيرة بتتقري أحسن لما الصورة تبقى أصغر)
-            left = im.crop((0, 0, int(im.width * 0.62), im.height))
-            for sc_ in (2, 3):
-                extra = _ocr_words(left, sc_)
-                if extra:
-                    words = words + extra
-                    pbox = find_price_box(words, price, pct, im.height * 0.12, im)
-                    if pbox:
-                        break
-        below = pbox[3] if pbox else 0
-        rbox = find_rating_box(words, pbox[1] if pbox else im.height * 0.4) if words else None
-        cboxes = find_coupon_boxes(words, below, im, (pbox[2] if pbox else None))
-
-        if rbox:   # شيل التقييمات
-            ImageDraw.Draw(im).rectangle(_clamp(rbox, im), fill=(255, 255, 255))
-            info["rating_hidden"] = True
-        ov = Image.new("RGBA", im.size, (0, 0, 0, 0))
-        od = ImageDraw.Draw(ov)
-        lw = max(4, im.width // 200)
-        if pbox:
-            od.rounded_rectangle(_clamp(pbox, im), radius=8, fill=PRICE_FILL, outline=PRICE_LINE + (255,), width=lw)
-            info["price"] = True
-        for b in cboxes:
-            od.rounded_rectangle(_clamp(b, im), radius=8, fill=COUPON_FILL, outline=COUPON_LINE + (255,), width=lw)
-        info["coupons"] = len(cboxes)
-        log.warning("shot: price_box=%s coupons=%d rating=%s", bool(pbox), len(cboxes), bool(rbox))
-        im = Image.alpha_composite(im.convert("RGBA"), ov).convert("RGB")
+        im = Image.open(io.BytesIO(data))
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+            bg.alpha_composite(im)
+            im = bg
+        im = im.convert("RGB")
+        box = int(CANVAS * PRODUCT_BOX)
+        im.thumbnail((box, box), Image.LANCZOS)
+        canvas = Image.new("RGB", (CANVAS, CANVAS), (255, 255, 255))
+        canvas.paste(im, ((CANVAS - im.width) // 2, (CANVAS - im.height) // 2))
+        if os.path.exists(LOGO_FILE):
+            logo = Image.open(LOGO_FILE).convert("RGBA")
+            w = int(CANVAS * LOGO_RATIO)
+            logo = logo.resize((w, int(w * logo.height / logo.width)), Image.LANCZOS)
+            pad = 28
+            canvas.paste(logo, (CANVAS - logo.width - pad, CANVAS - logo.height - pad), logo)
+        out = io.BytesIO()
+        canvas.save(out, "JPEG", quality=92)
+        return out.getvalue()
     except Exception as e:
-        log.warning("marking failed: %s", type(e).__name__)
+        log.warning("prepare_image failed: %s", e)
+        return None
 
-    bh = max(60, int(im.width * BANNER_H_RATIO))
-    card = Image.new("RGB", (im.width, im.height + bh), (255, 255, 255))
-    card.paste(im, (0, 0))
-    _banner(card, bh)
-    out = io.BytesIO()
-    card.save(out, "JPEG", quality=92)
-    return out.getvalue(), info
+
+def coupon_final(price, coupon):
+    """من نص الكوبون ("وفّر 7.65 جنيه" أو "وفّر 5%") يحسب السعر بعد الكوبون. بيرجع None لو مقدرش."""
+    try:
+        if not price or not coupon:
+            return None
+        m = re.search(r"(\d+(?:[.,]\d+)?)", coupon)
+        if not m:
+            return None
+        v = float(m.group(1).replace(",", "."))
+        if "%" in coupon or "٪" in coupon:
+            final = price * (1 - v / 100.0)
+        else:
+            final = price - v
+        if v <= 0 or final <= 0 or final >= price:
+            return None
+        return round(final, 2)
+    except Exception:
+        return None
+
+
+def coupon_block(price, coupon):
+    """سطور الكوبون في البوست: الكوبون + السعر بعد الكوبون (لو اتحسب)."""
+    if not coupon:
+        return []
+    lines = [f"🎟 <b>كوبون إضافي:</b> {html.escape(coupon)}", "(فعّل الكوبون من صفحة المنتج قبل الشراء)"]
+    final = coupon_final(price, coupon)
+    if final:
+        lines += [f"✅ <b>السعر بعد الكوبون: {fmt(final)}</b>"]
+    return lines + [""]
+
+
+# True = بوست مختصر تحت الكارت. False = البوست الكامل (العنوان والسعر والخصم) زي الأول.
+COMPACT_POST = False
+
+
+def product_card(title, price, old, raw, extra=None):
+    """كارت المنتج: اسم + سعر (+ خصم وسعر قديم وكوبون لو موجودين). None لو مفيش صورة أو سعر."""
+    if not raw or not price or not title:
+        return None
+    try:
+        import deal_card
+        pct = 0
+        if old and old > price:
+            pct = int(round((old - price) / old * 100))
+        if pct < 1:
+            pct, old = 0, None
+        item = {"title": title, "price": price, "old": old, "pct": pct}
+        if not pct:
+            item["badge"] = "متاح حاليًا"
+        item.update({k: v for k, v in (extra or {}).items() if v})
+        return deal_card.make_card(item, raw)
+    except Exception as e:
+        log.warning("card failed: %s", type(e).__name__)
+        return None
+
+
+def product_image(title, price, old, raw, extra=None):
+    """كارت العرض (لو فيه خصم) وإلا الصورة العادية على خلفية بيضاء."""
+    if not raw:
+        return None
+    return product_card(title, price, old, raw, extra) or prepare_image(raw)
+
+
+def short_title(t, limit=95):
+    t = re.sub(r"\s+", " ", t).strip()
+    if len(t) <= limit:
+        return t
+    return t[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def build_post(title, price, old, rating, link, compact=False, coupon=None):
+    pct = round((old - price) / old * 100) if (price and old and old > price) else None
+    cl = coupon_block(price, coupon)
+    if compact and pct:
+        # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
+        return "\n".join([
+            opener(pct, title) + f" — {fmt(price)} بدل {fmt(old)}",
+            "",
+        ] + cl + ["🛒 اشتري من هنا:", link, ""] + FOOTER_LINES)
+    lines = [opener(pct, title), "", f"<b>{html.escape(short_title(title))}</b>", ""]
+    if price:
+        lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
+        if old:
+            pct = round((old - price) / old * 100)
+            lines.append(f"🏷️ كان: <s>{fmt(old)}</s> (خصم {pct}%)")
+    lines += [""] + cl + ["🛒 اشتري من هنا:", link, ""]
+    lines += FOOTER_LINES
+    return "\n".join(lines)
+
+
+_names = {}
+
+
+async def _bot_username(key, token):
+    if _names.get(key):
+        return _names[key]
+    if not token:
+        return None
+    try:
+        from telegram import Bot
+        async with Bot(token) as b:
+            me = await b.get_me()
+        _names[key] = me.username
+        return me.username
+    except Exception as e:
+        log.warning("username lookup failed (%s): %s", key, type(e).__name__)
+        return None
+
+
+async def channel_kb():
+    """أزرار تحت كل بوست في القناة: تتبع السعر + البحث، وتحتهم أكواد الخصم."""
+    row = []
+    tracker = await _bot_username("tracker", os.environ.get("BOT_TOKEN", ""))
+    if tracker:
+        row.append(InlineKeyboardButton("📉 تتبع سعر أي منتج", url=f"https://t.me/{tracker}"))
+    row.append(InlineKeyboardButton("🔎 ابحث عن أي منتج", url="https://t.me/Mix_Compare_bot"))
+    rows = [row]
+    coupons = await _bot_username("coupons", os.environ.get("COUPON_BOT_TOKEN", ""))
+    if coupons:
+        rows.append([InlineKeyboardButton("🎟️ أكواد الخصم", url=f"https://t.me/{coupons}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_post(bot, chat_id, image, post, markup=None):
+    post = post.rstrip()
+    if markup is None and chat_id == CHANNEL:
+        markup = await channel_kb()
+    if image and len(post) <= 1000:
+        await bot.send_photo(chat_id, photo=image, caption=post, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+    if image:
+        await bot.send_photo(chat_id, photo=image)
+    await bot.send_message(
+        chat_id,
+        post,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+        disable_web_page_preview=True,
+    )
+
+
+# ---------------------------------------------------------------- product pipeline
+def resolve(url, headers):
+    """Follow redirects by hand; tolerate non-http redirect targets."""
+    cur = url
+    body = ""
+    for _ in range(10):
+        r = requests.get(cur, headers=headers, timeout=25, allow_redirects=False)
+        body = r.text or ""
+        loc = r.headers.get("Location")
+        if r.status_code in (301, 302, 303, 307, 308) and loc:
+            nxt = urljoin(cur, loc)
+            if not nxt.lower().startswith(("http://", "https://")):
+                m = re.search(r"https?://[^\s\"']+", unquote(loc))
+                if not m:
+                    return cur, body
+                nxt = m.group(0)
+            cur = nxt
+            continue
+        break
+    return cur, body
+
+
+def process_link(url):
+    """Blocking. Returns (ok, data_or_message)."""
+    debug = []
+    final, body, asin = url, "", None
+    for headers in HEADER_STRATEGIES:
+        try:
+            final, body = resolve(url, headers)
+        except Exception as e:
+            debug.append(f"فتح الرابط: {type(e).__name__}")
+            continue
+        asin = find_asin(final) or find_asin(url) or find_asin(body)
+        if asin:
+            break
+    if not asin:
+        return False, "معرفتش أوصل لصفحة المنتج من الرابط ده.\n" + "\n".join(debug)
+
+    host = urlparse(final).netloc.lower()
+    if "amazon." not in host or host.startswith("link."):
+        host = "www.amazon.eg"
+
+    target = f"https://{host}/dp/{asin}"
+    final_url, page = get_page(target, debug)
+    if not page:
+        return False, "أمازون مردتش على البوت.\n" + "\n".join(debug)
+
+    title, price, old, rating, img = read_product(page)
+    log.info("parsed title=%s price=%s old=%s rating=%s img=%s", bool(title), price, old, rating, bool(img))
+    if not title:
+        return False, "الصفحة اتفتحت بس معرفتش أقرا اسم المنتج.\n" + "\n".join(debug)
+
+    link = affiliate(host, asin)
+    raw = download_image(img)
+    try:
+        import deals_scanner
+        coupon = deals_scanner.extract_coupon(page, asin)
+    except Exception:
+        coupon = None
+    card = product_card(title, price, old, raw, {"rating": rating, "coupon": coupon})
+    image = card or (prepare_image(raw) if raw else None)
+    post = build_post(title, price, old, rating, link, compact=COMPACT_POST and bool(card), coupon=coupon)
+    return True, {"image": image, "post": post, "price": price, "title": title, "old": old, "rating": rating,
+                  "link": link, "asin": asin, "host": host, "coupon": coupon}
+
+
+# ---------------------------------------------------------------- handlers
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if OWNER_ID == 0:
+        await update.message.reply_text(f"رقمك (ID): {user.id}\nحطه في OWNER_ID وشغل البوت تاني.")
+        return
+    if is_allowed(user.id):
+        await update.message.reply_text("أهلاً! ابعتلي لينك منتج من أمازون وأنا أجهزلك البوست 🛒\n📸 أو ابعت لقطة شاشة للمنتج ومعاها اللينك، وأنا أحط عليها مستطيلات السعر والكوبونات وشريط القناة.")
+        return
+    await update.message.reply_text("طلبك اتبعت للمسؤول، استنى الموافقة ✋")
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ قبول", callback_data=f"ap:{user.id}"),
+            InlineKeyboardButton("❌ رفض", callback_data=f"dn:{user.id}"),
+        ]]
+    )
+    name = user.full_name or "مستخدم"
+    uname = f"@{user.username}" if user.username else "بدون يوزر"
+    try:
+        await context.bot.send_message(
+            OWNER_ID, f"طلب استخدام جديد:\n{name} ({uname})\nID: {user.id}", reply_markup=kb
+        )
+    except Exception as e:
+        log.warning("notify owner failed: %s", e)
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not ALLOWED:
+        await update.message.reply_text("مفيش مستخدمين مضافين.")
+        return
+    await update.message.reply_text("\n".join(f"{n} — {i}" for i, n in ALLOWED.items()))
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return
+    if not context.args:
+        await update.message.reply_text("اكتب: /remove ID")
+        return
+    if ALLOWED.pop(context.args[0], None) is not None:
+        save_users(ALLOWED)
+        await update.message.reply_text("تم الحذف ✅")
+    else:
+        await update.message.reply_text("الرقم ده مش في القائمة.")
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_allowed(user.id):
+        await update.message.reply_text("مش مسموحلك تستخدم البوت. ابعت /start عشان تطلب الإذن.")
+        return
+    editing = context.bot_data.setdefault("editing", {})
+    if user.id in editing:
+        pid = editing.pop(user.id)
+        txt = (update.message.text or "").strip()
+        item = load_draft(pid)
+        if not item:
+            await update.message.reply_text("البوست ده انتهى.")
+            return
+        if txt in ("إلغاء", "الغاء"):
+            await update.message.reply_text("اتلغى التعديل. البوست القديم لسه موجود.")
+            return
+        post = html.escape(txt)
+        store_draft(pid, item["uid"], item["image"], post, item.get("src"))
+        await send_post(context.bot, update.effective_chat.id, item["image"], post, make_kb(pid))
+        return
+    m = re.search(r"https?://\S+", update.message.text or "")
+    pend = context.bot_data.setdefault("pending_shot", {})
+    if m and user.id in pend:
+        raw = pend.pop(user.id)
+        await _finish_shot(update, context, raw, m.group(0).rstrip(").,"))
+        return
+    if not m:
+        await update.message.reply_text("ابعتلي لينك المنتج من أمازون 🔗")
+        return
+    wait = await update.message.reply_text("⏳ بقرا بيانات المنتج...")
+    try:
+        ok, res = await asyncio.to_thread(process_link, m.group(0).rstrip(").,"))
+    except Exception as e:
+        log.exception("process_link crashed")
+        ok, res = False, f"حصل خطأ غير متوقع: {type(e).__name__}"
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    if not ok:
+        await update.message.reply_text("❌ " + res)
+        return
+    pid = new_pid()
+    store_draft(pid, user.id, res["image"], res["post"])
+    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
+
+
+def _pct_of(price, old):
+    if price and old and old > price:
+        return int(round((old - price) / old * 100))
+    return None
+
+
+def _make_shot_draft(raw, url):
+    """Blocking. لقطة الشاشة + لينك المنتج -> (صورة، بوست). لو صفحة المنتج مقرتش بيطلع بوست بسيط باللينك والفوتر."""
+    import shot_card
+    ok, res = process_link(url)
+    if ok:
+        price, old = res["price"], res["old"]
+        img, info = shot_card.make_shot(raw, price=price, pct=_pct_of(price, old))
+        post = build_post(res["title"], price, old, res["rating"], res["link"], compact=bool(_pct_of(price, old)),
+                          coupon=res.get("coupon"))
+        return True, {"image": img, "post": post, "info": info}
+    asin = find_asin(url)
+    if not asin:
+        return False, res
+    host = urlparse(url).netloc.lower()
+    host = host if ("amazon." in host and not host.startswith("link.")) else "www.amazon.eg"
+    img, info = shot_card.make_shot(raw)
+    post = "\n".join([opener(None, ""), "", "🛒 اشتري من هنا:", affiliate(host, asin), ""] + FOOTER_LINES)
+    return True, {"image": img, "post": post, "info": info}
+
+
+async def _finish_shot(update, context, raw, url):
+    user = update.effective_user
+    wait = await update.effective_message.reply_text("⏳ بجهز اللقطة...")
+    try:
+        ok, res = await asyncio.to_thread(_make_shot_draft, raw, url)
+    except Exception as e:
+        log.exception("shot failed")
+        ok, res = False, f"حصل خطأ غير متوقع: {type(e).__name__}"
+    try:
+        await wait.delete()
+    except Exception:
+        pass
+    if not ok:
+        await update.effective_message.reply_text("❌ " + str(res))
+        return
+    pid = new_pid()
+    store_draft(pid, user.id, res["image"], res["post"])
+    await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
+    info = res["info"]
+    if not info.get("price") and not info.get("coupons"):
+        await update.effective_message.reply_text(
+            "ℹ️ مقدرتش أحدد مكان السعر والكوبونات في اللقطة فنزلت من غير مستطيلات "
+            "(لو مش مثبّت tesseract على Termux اكتب: pkg install tesseract)."
+        )
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لقطة شاشة لصفحة المنتج: لو مكتوب معاها لينك بيجهّز المسودة، وإلا بيستنى اللينك."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not is_allowed(user.id):
+        await msg.reply_text("مش مسموحلك تستخدم البوت. ابعت /start عشان تطلب الإذن.")
+        return
+    try:
+        if msg.photo:
+            f = await msg.photo[-1].get_file()
+        else:
+            f = await msg.document.get_file()
+        raw = bytes(await f.download_as_bytearray())
+    except Exception as e:
+        await msg.reply_text(f"معرفتش أنزّل الصورة: {type(e).__name__}")
+        return
+    m = re.search(r"https?://\S+", msg.caption or "")
+    if m:
+        await _finish_shot(update, context, raw, m.group(0).rstrip(").,"))
+        return
+    context.bot_data.setdefault("pending_shot", {})[user.id] = raw
+    await msg.reply_text("📸 استلمت اللقطة. ابعتلي دلوقتي لينك المنتج من أمازون.")
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action, _, val = (q.data or "").partition(":")
+    uid = q.from_user.id
+
+    if action in ("ap", "dn"):
+        if uid != OWNER_ID:
+            return
+        if action == "ap":
+            ALLOWED[val] = q.message.text.split("\n")[1] if q.message and q.message.text else val
+            save_users(ALLOWED)
+            await q.edit_message_text(f"تم قبول المستخدم {val} ✅")
+            try:
+                await context.bot.send_message(int(val), "اتقبلت ✅ ابعتلي لينك منتج أمازون.")
+            except Exception:
+                pass
+        else:
+            await q.edit_message_text(f"تم رفض المستخدم {val} ❌")
+            try:
+                await context.bot.send_message(int(val), "للأسف الطلب اترفض.")
+            except Exception:
+                pass
+        return
+
+    async def say(text, **kw):
+        try:
+            await context.bot.send_message(uid, text, **kw)
+        except Exception as e:
+            log.warning("say failed: %s", type(e).__name__)
+
+    item = load_draft(val)
+    if not item:
+        await say("البوست ده انتهى، ابعت اللينك تاني.")
+        return
+    if uid != item["uid"] and uid != OWNER_ID:
+        return
+
+    if action == "cx":
+        await clear_src(context.bot, item)
+        drop_draft(val)
+        await say("اتلغى ❌")
+        return
+
+    if action == "ed":
+        context.bot_data.setdefault("editing", {})[uid] = val
+        await say(plain(item["post"]), disable_web_page_preview=True)
+        await say("✏️ انسخ النص اللي فوق، عدّل عليه، وابعته هنا.\nعشان تلغي التعديل ابعت: إلغاء")
+        return
+
+    if action == "pub":
+        try:
+            await send_post(context.bot, CHANNEL, item["image"], item["post"])
+        except Exception as e:
+            log.exception("publish failed")
+            await say(f"معرفتش أنشر: {type(e).__name__}\nتأكد إن البوت أدمن في القناة.")
+            return
+        await clear_src(context.bot, item)
+        drop_draft(val)
+        await say("اتنشر في القناة ✅")
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    log.warning("handler error: %s", type(context.error).__name__)
+
+
+def main():
+    if not TOKEN:
+        print("POST_BOT_TOKEN مش موجود. اعمل export الأول.")
+        return
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)
+        .connect_timeout(20)
+        .read_timeout(40)
+        .write_timeout(60)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    print("Bot is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
