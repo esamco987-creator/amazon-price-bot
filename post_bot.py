@@ -792,8 +792,10 @@ def _make_shot_draft(raw, url):
     if ok:
         price, old = res["price"], res["old"]
         img, info = shot_card.make_shot(raw, price=price, pct=_pct_of(price, old))
+        # الكوبون من اللقطة نفسها (صفحة أمازون من غير تسجيل دخول غالبًا مبتورّيش الكوبون)
+        coupon = info.get("coupon") or res.get("coupon")
         post = build_post(res["title"], price, old, res["rating"], res["link"], compact=bool(_pct_of(price, old)),
-                          coupon=res.get("coupon"))
+                          coupon=coupon)
         return True, {"image": img, "post": post, "info": info}
     asin = find_asin(url)
     if not asin:
