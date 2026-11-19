@@ -51,7 +51,7 @@ RETRY_GAP = 20 * 60          # لو صفحة أمازون مردتش: نجرب �
 MAX_TRIES = 4                # بعد كام محاولة فاشلة نوقف المراجعة للبوست
 CYCLE_EVERY = 15 * 60
 PRICE_TOL = 0.01             # فرق السعر المسموح (1%)
-PREFIX = "🔁 اتأكدنا: العرض لسه شغال بنفس السعر ✅\n\n"
+PREFIX = ""   # مفيش جملة قبل البوست المعاد
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE, "repost_log.txt")
 
