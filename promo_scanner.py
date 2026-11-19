@@ -156,7 +156,10 @@ def diagnose(body):
     )
 
 
-_JUNK_TITLE = re.compile(r"^\s*(?:تخط[يى]|تجاوز|Skip\b|انتقل إلى|Go to\b|القائمة|Menu\b|Amazon\b|أمازون)", re.I)
+_JUNK_TITLE = re.compile(
+    r"^\s*(?:تخط[يى]|تجاوز|Skip\b|انتقل إلى|Go to\b|القائمة|Menu\b|Amazon\b|أمازون|اختصارات|Keyboard\b|لوحة المفاتيح|"
+    r"إمكانية الوصول|Accessibility|تسجيل الدخول|Sign in|مرحبا|Hello|السلة|Cart\b|الحساب|Account\b|"
+    r"القوائم|Lists\b|الطلبات|Orders\b|ابحث|Search\b|البريد|Deliver)", re.I)
 
 
 def _junk_title(t):
