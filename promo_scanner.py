@@ -37,6 +37,8 @@ PROMO_PATTERNS = [
     r"اشتر[يى]?\s*\d+\s*(?:و|واحصل|احصل)[^\n]{0,50}",
     r"وفر\s*\d+\s*%[^\n]{0,60}",
     r"وفر\s*[\d.,]+\s*جنيه[^\n]{0,60}",
+    r"خصم\s*\d+\s*%[^\n]{0,60}",
+    r"\d+\s*%\s*(?:خصم|تخفيض)[^\n]{0,60}",
     r"Save\s+[^\n]{0,70}",
     r"Buy\s+\d+[^\n]{0,60}",
 ]
@@ -154,6 +156,14 @@ def diagnose(body):
     )
 
 
+_JUNK_TITLE = re.compile(r"^\s*(?:تخط[يى]|تجاوز|Skip\b|انتقل إلى|Go to\b|القائمة|Menu\b|Amazon\b|أمازون)", re.I)
+
+
+def _junk_title(t):
+    """روابط الوصول السريع في أول الصفحة ("تخطى إلى المحتوى الرئيسي") مش عنوان عرض."""
+    return bool(_JUNK_TITLE.match(t or "")) or len((t or "").strip()) < 4
+
+
 def promo_info(body):
     """يرجع (عنوان العرض، تواريخ أو None)."""
     soup = BeautifulSoup(body, "html.parser")
@@ -163,8 +173,8 @@ def promo_info(body):
     lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines()]
     lines = [l for l in lines if l]
     title = None
-    for l in lines[:120]:
-        if len(l) > 120:
+    for l in lines[:400]:
+        if len(l) > 120 or _junk_title(l):
             continue
         for p in PROMO_PATTERNS:
             m = re.search(p, l, flags=re.I)
@@ -174,11 +184,18 @@ def promo_info(body):
         if title:
             break
     if not title:
-        h = soup.find(["h1", "h2"])
-        if h:
+        for h in soup.find_all(["h1", "h2"]):
             t = re.sub(r"\s+", " ", h.get_text(" ")).strip()
-            if 3 < len(t) < 100:
+            if 3 < len(t) < 100 and not _junk_title(t):
                 title = t
+                break
+    if not title:
+        og = soup.find("meta", property="og:title")
+        t = re.sub(r"\s+", " ", (og.get("content") if og and og.get("content") else "") or
+                   (soup.title.string if soup.title and soup.title.string else "")).strip()
+        t = re.sub(r"^(?:amazon|أمازون)[\w.]*\s*[:：|\-–]\s*", "", t, flags=re.I).strip()
+        if 3 < len(t) < 100 and not _junk_title(t):
+            title = t
     dates = None
     joined = " ".join(lines[:200])
     m = DATE_RE.search(joined) or DATE_EN_RE.search(joined)
@@ -228,7 +245,7 @@ def fix_url(u):
     return "https:" + u if u.startswith("//") else u
 
 
-def load_promo(url, tries=4):
+def load_promo(url, tries=3):
     """بيحاول كذا مرة: أمازون أحيانًا بيرجّع صفحة ناقصة (من غير csrf) وبتنجح في المحاولة اللي بعدها."""
     info = None
     for i in range(tries):
@@ -236,7 +253,7 @@ def load_promo(url, tries=4):
         if info and info.get("products"):
             return info
         if i < tries - 1:
-            time.sleep(2 + i * 2)
+            time.sleep(6 + i * 10)
     if info is not None:
         note(f"promo gave no products after {tries} tries")
     return info
@@ -276,6 +293,8 @@ def _load_promo_once(url):
             r, body, final, hdr = r_try, b, u, h
         if has:
             break
+        if r_try.status_code == 503 and k >= 1:
+            break  # أمازون بيحجب/بيبطّأ الطلبات: ما نضغطش عليه أكتر
     if r is None:
         return None
     host = urlparse(r.url).netloc or HOST
