@@ -669,7 +669,7 @@ def _clean_amazon_url(final):
         return final
 
 
-def process_page_link(final, body, original, debug):
+def process_page_link(final, body, original, debug, title_hint=None):
     """لينك مش منتج واحد (صفحة عروض مجمّعة "وفّر 30% على ..." أو بحث/قسم): كارت + بوست باللينك بكودك."""
     import deal_card
     host = "www.amazon.eg"
@@ -683,6 +683,8 @@ def process_page_link(final, body, original, debug):
             info = promos.load_promo(link)
             if info:
                 title, dates = info.get("title"), info.get("dates")
+                if title and promos._junk_title(title):
+                    title = None
                 for p in (info.get("products") or [])[:8]:
                     if len(imgs) >= 4:
                         break
@@ -691,7 +693,8 @@ def process_page_link(final, body, original, debug):
                         imgs.append(raw)
         except Exception as e:
             debug.append(f"قراءة صفحة العرض: {type(e).__name__}")
-        title = title or "عرض خاص على أمازون"
+        dbg_html = (info or {}).get("body") if "info" in locals() and info else None
+        title = (title_hint or "").strip() or title or "عرض خاص على أمازون"
         try:
             image = deal_card.make_promo_card(title, imgs, dates) if imgs else deal_card.make_text_promo_card(title, dates)
         except Exception:
@@ -702,7 +705,7 @@ def process_page_link(final, body, original, debug):
         lines += ["", "ℹ️ شروط العرض بتتطبق في عربة التسوق. راجعها في الصفحة.", "",
                   "🛒 افتح العرض من هنا:", link, ""] + FOOTER_LINES
         return True, {"image": image, "post": "\n".join(lines).rstrip(), "price": None, "title": title, "old": None,
-                      "rating": "", "link": link, "asin": None, "host": host, "coupon": None}
+                      "rating": "", "link": link, "asin": None, "host": host, "coupon": None, "debug_html": dbg_html}
     # صفحة أمازون عامة (بحث/قسم/عروض اليوم)
     if "amazon." in urlparse(final).netloc.lower():
         link = _clean_amazon_url(final)
@@ -717,6 +720,7 @@ def process_page_link(final, body, original, debug):
         except Exception:
             title = ""
         title = re.sub(r"^[\W_]*eg\s*[:：]\s*", "", title or "", flags=re.I).strip()
+        title = (title_hint or "").strip() or title
         head = f"🔥 <b>{html.escape(title)}</b>" if title else "🔥 <b>عروض على أمازون</b>"
         lines = [head, "", "🛒 افتح العرض من هنا:", link, ""] + FOOTER_LINES
         return True, {"image": None, "post": "\n".join(lines).rstrip(), "price": None, "title": title, "old": None,
@@ -724,8 +728,8 @@ def process_page_link(final, body, original, debug):
     return None
 
 
-def process_link(url):
-    """Blocking. Returns (ok, data_or_message)."""
+def process_link(url, title_hint=None):
+    """Blocking. Returns (ok, data_or_message). title_hint: عنوان تكتبه إنت لصفحات العروض المجمّعة."""
     debug = []
     final, body, asin = url, "", None
     pages = []
@@ -749,7 +753,7 @@ def process_link(url):
             break
     if not asin:
         for f2, b2 in pages:
-            res = process_page_link(f2, b2, url, debug)
+            res = process_page_link(f2, b2, url, debug, title_hint)
             if res:
                 return res
         return False, "معرفتش أوصل لصفحة المنتج من الرابط ده.\n" + "\n".join(debug)
@@ -860,8 +864,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ابعتلي لينك المنتج من أمازون 🔗")
         return
     wait = await update.message.reply_text("⏳ بقرا بيانات المنتج...")
+    hint = re.sub(r"\s+", " ", (update.message.text or "").replace(m.group(0), " ")).strip()[:90]   # عنوان لصفحات العروض
     try:
-        ok, res = await asyncio.to_thread(process_link, m.group(0).rstrip(").,"))
+        ok, res = await asyncio.to_thread(process_link, m.group(0).rstrip(").,"), hint or None)
     except Exception as e:
         log.exception("process_link crashed")
         ok, res = False, f"حصل خطأ غير متوقع: {type(e).__name__}"
@@ -875,6 +880,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pid = new_pid()
     store_draft(pid, user.id, res["image"], res["post"])
     await send_post(context.bot, update.effective_chat.id, res["image"], res["post"], make_kb(pid))
+    dbg = res.get("debug_html")
+    if dbg and user.id == OWNER_ID and not context.bot_data.get("promo_dbg_sent"):
+        context.bot_data["promo_dbg_sent"] = True      # مرة واحدة: صفحة العرض عشان نظبط قراءة العنوان
+        try:
+            await context.bot.send_document(OWNER_ID, io.BytesIO(dbg.encode("utf-8", "ignore")),
+                                            filename="promo_page.html", caption="نسخة من صفحة العرض (للتحليل)")
+        except Exception as e:
+            log.warning("debug page send failed: %s", type(e).__name__)
 
 
 def _pct_of(price, old):
