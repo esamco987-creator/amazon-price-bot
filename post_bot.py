@@ -647,20 +647,111 @@ def resolve(url, headers):
     return cur, body
 
 
+_TRACK = {
+    "linkcode", "linkid", "ref", "ref_", "ascsubtag", "btn_type", "btn_ref", "srctok", "creative", "creativeasin",
+    "camp", "_encoding", "content-id", "pd_rd_r", "pd_rd_w", "pd_rd_wg", "pf_rd_p", "pf_rd_r", "pf_rd_s", "pf_rd_t",
+    "pf_rd_i", "pf_rd_m", "psc", "qid", "sr", "crid", "sprefix", "th", "language", "social_share", "gclid", "fbclid",
+}
+PROMO_RE = re.compile(r"/promotion/psp/([A-Za-z0-9]+)")
+AMZ_URL_RE = re.compile(r"https?://(?:www\.)?amazon\.eg/[^\s\"'<>\\]+")
+
+
+def _clean_amazon_url(final):
+    """بيشيل بارامترات التتبع من لينك أمازون (بحث/قسم/عروض) ويحط كودك."""
+    try:
+        base, _, query = final.partition("?")
+        query = query.split("#", 1)[0].split(";", 1)[0]
+        keep = [p for p in query.split("&") if p and p.split("=", 1)[0].lower() not in _TRACK
+                and p.split("=", 1)[0].lower() != "tag"]
+        keep.append(f"tag={MY_TAG}")
+        return base + "?" + "&".join(keep)
+    except Exception:
+        return final
+
+
+def process_page_link(final, body, original, debug):
+    """لينك مش منتج واحد (صفحة عروض مجمّعة "وفّر 30% على ..." أو بحث/قسم): كارت + بوست باللينك بكودك."""
+    import deal_card
+    host = "www.amazon.eg"
+    pm = PROMO_RE.search(final) or PROMO_RE.search(original) or PROMO_RE.search(body.replace("\\/", "/"))
+    if pm:
+        link = f"https://{host}/promotion/psp/{pm.group(1)}?tag={MY_TAG}"
+        title = dates = None
+        imgs = []
+        try:
+            import promo_scanner as promos
+            info = promos.load_promo(link)
+            if info:
+                title, dates = info.get("title"), info.get("dates")
+                for p in (info.get("products") or [])[:8]:
+                    if len(imgs) >= 4:
+                        break
+                    raw = download_image(p["image"]) if p.get("image") else None
+                    if raw:
+                        imgs.append(raw)
+        except Exception as e:
+            debug.append(f"قراءة صفحة العرض: {type(e).__name__}")
+        title = title or "عرض خاص على أمازون"
+        try:
+            image = deal_card.make_promo_card(title, imgs, dates) if imgs else deal_card.make_text_promo_card(title, dates)
+        except Exception:
+            image = None
+        lines = [f"🎁 <b>{html.escape(title)}</b>"]
+        if dates:
+            lines.append(f"📅 {html.escape(dates)}")
+        lines += ["", "ℹ️ شروط العرض بتتطبق في عربة التسوق. راجعها في الصفحة.", "",
+                  "🛒 افتح العرض من هنا:", link, ""] + FOOTER_LINES
+        return True, {"image": image, "post": "\n".join(lines).rstrip(), "price": None, "title": title, "old": None,
+                      "rating": "", "link": link, "asin": None, "host": host, "coupon": None}
+    # صفحة أمازون عامة (بحث/قسم/عروض اليوم)
+    if "amazon." in urlparse(final).netloc.lower():
+        link = _clean_amazon_url(final)
+        title = ""
+        try:
+            _, page = get_page(final, debug)
+            if page:
+                soup = BeautifulSoup(page, "html.parser")
+                og = soup.find("meta", property="og:title")
+                title = clean_title((og.get("content") if og and og.get("content") else "") or
+                                    (soup.title.string if soup.title and soup.title.string else ""))
+        except Exception:
+            title = ""
+        title = re.sub(r"^[\W_]*eg\s*[:：]\s*", "", title or "", flags=re.I).strip()
+        head = f"🔥 <b>{html.escape(title)}</b>" if title else "🔥 <b>عروض على أمازون</b>"
+        lines = [head, "", "🛒 افتح العرض من هنا:", link, ""] + FOOTER_LINES
+        return True, {"image": None, "post": "\n".join(lines).rstrip(), "price": None, "title": title, "old": None,
+                      "rating": "", "link": link, "asin": None, "host": host, "coupon": None}
+    return None
+
+
 def process_link(url):
     """Blocking. Returns (ok, data_or_message)."""
     debug = []
     final, body, asin = url, "", None
+    pages = []
     for headers in HEADER_STRATEGIES:
         try:
             final, body = resolve(url, headers)
         except Exception as e:
             debug.append(f"فتح الرابط: {type(e).__name__}")
             continue
-        asin = find_asin(final) or find_asin(url) or find_asin(body)
+        if "amazon." not in urlparse(final).netloc.lower():
+            # لينك مختصر مش بيحوّل مباشرة: نلاقي لينك أمازون جوه الصفحة
+            m = AMZ_URL_RE.search(body.replace("\\/", "/"))
+            if m:
+                final = m.group(0)
+        pages.append((final, body))
+        if PROMO_RE.search(final) or PROMO_RE.search(url):
+            asin = find_asin(final) or find_asin(url)     # صفحة عرض: ASIN جوه الصفحة بتاع منتج عشوائي مش المقصود
+        else:
+            asin = find_asin(final) or find_asin(url) or find_asin(body)
         if asin:
             break
     if not asin:
+        for f2, b2 in pages:
+            res = process_page_link(f2, b2, url, debug)
+            if res:
+                return res
         return False, "معرفتش أوصل لصفحة المنتج من الرابط ده.\n" + "\n".join(debug)
 
     host = urlparse(final).netloc.lower()
