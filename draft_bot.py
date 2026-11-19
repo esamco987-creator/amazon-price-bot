@@ -157,6 +157,32 @@ def _remember(image, post):
         log.warning("repost record skipped: %s", type(e).__name__)
 
 
+_ADMIN_CACHE = {}
+
+
+async def is_allowed(bot, uid):
+    """المسموح له يدوس نشر/تعديل: صاحب البوت، أو أي مشرف (أدمن) في القناة، أو أرقام في DRAFT_ADMINS (مفصولة بفاصلة)."""
+    import time as _t
+    if uid == OWNER_ID:
+        return True
+    extra = {x.strip() for x in os.environ.get("DRAFT_ADMINS", "").split(",") if x.strip()}
+    if str(uid) in extra:
+        return True
+    hit = _ADMIN_CACHE.get(uid)
+    if hit and _t.time() - hit[0] < 600:
+        return hit[1]
+    ok = False
+    try:
+        m = await bot.get_chat_member(CHANNEL, uid)
+        ok = m.status in ("administrator", "creator")
+    except Exception as e:
+        log.warning("admin check failed: %s", type(e).__name__)
+        hit = _ADMIN_CACHE.get(uid)
+        return hit[1] if hit else False      # لو تليجرام ماردش نفضل على آخر نتيجة معروفة
+    _ADMIN_CACHE[uid] = (_t.time(), ok)
+    return ok
+
+
 async def send_post(bot, chat_id, image, post):
     kb = await channel_kb() if chat_id == CHANNEL else None
     if is_photo_caption(image, post):
@@ -202,7 +228,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if OWNER_ID == 0:
         await update.message.reply_text(f"رقمك (ID): {uid}\nحطه في OWNER_ID وشغل البوت تاني.")
-    elif uid == OWNER_ID:
+    elif await is_allowed(context.bot, uid):
         await update.message.reply_text("جاهز ✅ المسودات هتظهر في قناة مسودة العروض بأزرار نشر وتعديل.")
 
 
@@ -210,7 +236,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     action, _, val = (q.data or "").partition(":")
     uid = q.from_user.id
-    if uid != OWNER_ID:
+    if not await is_allowed(context.bot, uid):
         await safe_answer(q, "مش مسموحلك تستخدم الزرار ده.", True)
         return
     if action == "pub":
@@ -279,7 +305,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if uid != OWNER_ID:
+    if not await is_allowed(context.bot, uid):
         return
     editing = context.bot_data.setdefault("editing", {})
     if uid not in editing:
