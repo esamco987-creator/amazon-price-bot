@@ -567,6 +567,7 @@ def build_post(title, price, old, rating, link, compact=False, coupon=None):
     return "\n".join(lines)
 
 
+SHOW_COUPON_BUTTON = False  # زرار "أكواد الخصم" تحت البوستات (غيّرها لـ True لو عايزه يرجع)
 _names = {}
 
 
@@ -594,7 +595,7 @@ async def channel_kb():
         row.append(InlineKeyboardButton("📉 تتبع سعر أي منتج", url=f"https://t.me/{tracker}"))
     row.append(InlineKeyboardButton("🔎 ابحث عن أي منتج", url="https://t.me/Mix_Compare_bot"))
     rows = [row]
-    coupons = await _bot_username("coupons", os.environ.get("COUPON_BOT_TOKEN", ""))
+    coupons = (await _bot_username("coupons", os.environ.get("COUPON_BOT_TOKEN", ""))) if SHOW_COUPON_BUTTON else None
     if coupons:
         rows.append([InlineKeyboardButton("🎟️ أكواد الخصم", url=f"https://t.me/{coupons}")])
     return InlineKeyboardMarkup(rows)
