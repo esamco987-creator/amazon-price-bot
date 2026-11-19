@@ -113,6 +113,7 @@ def is_photo_caption(image, post):
 
 SEARCH_BOT = "Mix_Compare_bot"  # بوت البحث
 TRACKER_TOKEN = os.environ.get("BOT_TOKEN", "")  # توكن بوت التتبع: بنسأل تليجرام عن اليوزر بتاعه تلقائي
+SHOW_COUPON_BUTTON = False  # زرار "أكواد الخصم" تحت البوستات (غيّرها لـ True لو عايزه يرجع)
 COUPON_TOKEN = os.environ.get("COUPON_BOT_TOKEN", "")  # توكن بوت الأكواد (لو موجود بيظهر زرار الأكواد)
 _names = {}
 
@@ -141,7 +142,7 @@ async def channel_kb():
         row.append(InlineKeyboardButton("📉 تتبع سعر أي منتج", url=f"https://t.me/{tracker}"))
     row.append(InlineKeyboardButton("🔎 ابحث عن أي منتج", url=f"https://t.me/{SEARCH_BOT}"))
     rows = [row]
-    coupons = await bot_username("coupons", COUPON_TOKEN)
+    coupons = await bot_username("coupons", COUPON_TOKEN) if SHOW_COUPON_BUTTON else None
     if coupons:
         rows.append([InlineKeyboardButton("🎟️ أكواد الخصم", url=f"https://t.me/{coupons}")])
     return InlineKeyboardMarkup(rows)
