@@ -5,7 +5,8 @@
   REPOST_HOURS=2         كل قد إيه ساعة نعيد نفس البوست
   REPOST_MAX_AGE_H=24    مانعيدش بوست أقدم من كده
   REPOST_MAX_TIMES=3     أقصى عدد مرات إعادة للبوست
-  REPOST_PER_CYCLE=2     أقصى عدد بوستات نعيدها في المرة
+  REPOST_PER_CYCLE=1     أقصى عدد بوستات نعيدها في المرة
+  REPOST_GAP_MIN=45      أقل فاصل (بالدقايق) بين أي إعادتين في القناة (عشان القناة ماتتغرقش)
   REPOST_QUIET=1-8       ساعات هدوء (مفيش إعادة فيها)
   REPOST_DELETE_OLD=1    يمسح نسخة الإعادة القديمة لما ينزل نسخة جديدة (من غير البوست الأصلي)
 """
@@ -45,7 +46,8 @@ HOUR = 3600
 MIN_GAP = _num("REPOST_HOURS", 2) * HOUR
 MAX_AGE = _num("REPOST_MAX_AGE_H", 24) * HOUR
 MAX_TIMES = int(_num("REPOST_MAX_TIMES", 3))
-PER_CYCLE = int(_num("REPOST_PER_CYCLE", 2))
+PER_CYCLE = int(_num("REPOST_PER_CYCLE", 1))
+GAP = _num("REPOST_GAP_MIN", 45) * 60      # فاصل بين أي إعادتين
 DELETE_OLD = os.environ.get("REPOST_DELETE_OLD", "1") != "0"
 RETRY_GAP = 20 * 60          # لو صفحة أمازون مردتش: نجرب تاني بعد كده
 MAX_TRIES = 4                # بعد كام محاولة فاشلة نوقف المراجعة للبوست
@@ -54,6 +56,23 @@ PRICE_TOL = 0.01             # فرق السعر المسموح (1%)
 PREFIX = ""   # مفيش جملة قبل البوست المعاد
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE, "repost_log.txt")
+LAST_FILE = os.path.join(BASE, "repost_last.txt")
+
+
+def last_repost_ts():
+    try:
+        with open(LAST_FILE, "r") as f:
+            return float(f.read().strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def mark_repost_now():
+    try:
+        with open(LAST_FILE, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
 
 
 def note(msg):
@@ -130,6 +149,8 @@ async def run_cycle(bot):
     now = int(time.time())
     if quiet_now():
         return
+    if now - last_repost_ts() < GAP:
+        return                      # لسه ماعدّاش الفاصل من آخر إعادة (أي بوست)
     rows = rs.due(now, MIN_GAP, MAX_AGE, MAX_TIMES, RETRY_GAP, PER_CYCLE * 3)
     done = 0
     for row in rows:
@@ -171,6 +192,7 @@ async def run_cycle(bot):
             except Exception:
                 pass
         rs.update(asin, last_ts=int(time.time()), reposts=reposts + 1, last_msg=mid, tries=0)
+        mark_repost_now()
         note(f"{asin}: reposted (#{reposts + 1}) price {cur:g}")
         done += 1
         await asyncio.sleep(4)
@@ -182,7 +204,8 @@ async def main():
         return
     ph.init()
     rs.init()
-    note(f"repost bot on: every {MIN_GAP / HOUR:g}h, max {MAX_TIMES} times, quiet={os.environ.get('REPOST_QUIET', '1-8')}")
+    note(f"repost bot on: same post every {MIN_GAP / HOUR:g}h, any two reposts >= {GAP / 60:g}min apart, "
+         f"max {MAX_TIMES} times, quiet={os.environ.get('REPOST_QUIET', '1-8')}")
     async with Bot(TOKEN) as bot:
         while True:
             try:
