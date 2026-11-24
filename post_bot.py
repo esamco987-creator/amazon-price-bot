@@ -82,6 +82,109 @@ def opener(pct=None, title="", hot=False):
     return random.choice(pool)
 
 
+INTROS = [
+    "🔔 تنبيه عرض جديد! 🔔",
+    "🚀 عرض طاير النهارده! 🚀",
+    "💸 وفّر فلوسك مع العرض ده! 💸",
+    "🌟 اختيار اليوم من عروضنا! 🌟",
+    "📢 يا جماعة عرض مهم! 📢",
+    "🎁 هدية من أمازون ليكم! 🎁",
+    "👀 بصّوا على السعر ده! 👀",
+    "🔥 ولعت الأسعار النهارده! 🔥",
+    "✨ عرض يستاهل تشوفه! ✨",
+    "🛒 لو كنت محتاجه، دلوقتي وقته! 🛒",
+    "⏰ العرض شغال دلوقتي! ⏰",
+    "🏷️ خصم حقيقي مش كلام! 🏷️",
+    "🧨 سعر ضرب الأرض! 🧨",
+    "💪 عرض قوي ومضمون! 💪",
+    "😍 ده لازم يتشاف! 😍",
+    "🚨 عرض نار ومش هيستنى! 🚨",
+    "🔥 الحق قبل ما الكمية تخلص! 🔥",
+    "💥 سعر مجنون النهارده! 💥",
+    "⚡ فرصة متتعوضش، الحق! ⚡",
+    "🤯 مش مصدّق السعر ده! 🤯",
+    "🛍️ يا جماعة ده لازم ينزل عندكم! 🛍️",
+    "😱 الخصم ده نادر، شوفوه! 😱",
+    "💣 عرض قنبلة على أمازون! 💣",
+    "🏃 الحق العرض ده! 🏃",
+    "🎯 أحسن سعر شفناه لحد دلوقتي! 🎯",
+]
+_last_intro = [None]
+
+
+def intro():
+    """جملة بداية عشوائية من القايمة (من غير ما تتكرر مرتين ورا بعض)."""
+    pool = [x for x in INTROS if x != _last_intro[0]] or INTROS
+    _last_intro[0] = random.choice(pool)
+    return _last_intro[0]
+
+
+# (كلمات في اسم المنتج، إيموجي، هاشتاجات)
+CATEGORIES = [
+    (("سماع", "ايربود", "airpods", "هيدفون", "headphone", "earbuds"), "🎧", "#سماعات #إلكترونيات"),
+    (("موبايل", "تليفون", "هاتف", "ايفون", "iphone", "جالكسي", "galaxy", "شاومي", "phone"), "📱", "#موبايلات #إلكترونيات"),
+    (("لابتوب", "laptop", "ماك بوك", "macbook", "كمبيوتر"), "💻", "#لابتوب #إلكترونيات"),
+    (("تلفزيون", "شاشة", "تليفزيون", "tv"), "📺", "#تلفزيونات #إلكترونيات"),
+    (("ساعة", "ساعه", "watch"), "⌚", "#ساعات #إلكترونيات"),
+    (("كاميرا", "camera"), "📷", "#كاميرات #إلكترونيات"),
+    (("بلايستيشن", "playstation", "xbox", "جيم", "ألعاب", "العاب"), "🎮", "#ألعاب"),
+    (("مكنسة", "غسالة", "ثلاجة", "مروحة", "خلاط", "قلاية", "مكواة", "سخان", "بوتاجاز", "ميكروويف", "فرن", "كبة"), "🏠", "#أجهزة_منزلية"),
+    (("عطر", "برفان", "perfume"), "🌸", "#عطور"),
+    (("شامبو", "كريم", "مكياج", "سيروم", "غسول", "صابون", "ماسكارا", "بشرة", "شعر"), "💄", "#عناية #جمال"),
+    (("حفاض", "بامبرز", "pampers", "مولفكس", "molfix", "طفل", "أطفال"), "👶", "#أطفال"),
+    (("حذاء", "جزمة", "شبشب", "كوتشي", "sneaker", "shoe"), "👟", "#أحذية #موضة"),
+    (("تيشيرت", "قميص", "بنطلون", "جاكيت", "هودي", "فستان", "شنطة", "حقيبة"), "👕", "#ملابس #موضة"),
+    (("قهوة", "شاي", "زيت", "بسكويت", "شوكولاتة", "نسكافيه", "تونة", "سمن"), "🛒", "#بقالة"),
+]
+
+
+def category(title):
+    t = (title or "").lower()
+    for keys, emoji, tags in CATEGORIES:
+        if any(k in t for k in keys):
+            return emoji, tags
+    return "🛍️", "#عروض"
+
+
+def features_line(title, emoji):
+    """سطر المميزات: الأجزاء اللي بعد أول فاصلة في عنوان المنتج (لو موجودة)."""
+    t = re.sub(r"\s+", " ", title or "").strip()
+    parts = [p.strip(" .…-–") for p in re.split(r"[،,]", t)]
+    parts = [p for p in parts[1:] if 2 <= len(p) <= 40]
+    if not parts:
+        return None
+    s = "، ".join(parts[:2])
+    return f"{emoji} {html.escape(s[:70])}"
+
+
+def deal_post(title, price, old, link, cl=None, compact=False, footer=None):
+    """شكل البوست الموحد: جملة بداية + عنوان بالخصم + مميزات + السعر + الكمية + اللينك + هاشتاجات."""
+    pct = round((old - price) / old * 100) if (price and old and old > price) else None
+    emoji, tags = category(title)
+    name = short_name(title, words=6, limit=50)
+    lines = [intro(), ""]
+    if name:
+        if pct and pct >= 5:
+            lines.append(f"🔥 خصم {pct}% على <b>{html.escape(name)}</b>")
+        else:
+            lines.append(f"🔥 عرض على <b>{html.escape(name)}</b>")
+    if not compact:
+        f = features_line(title, emoji)
+        if f:
+            lines.append(f)
+    if price:
+        if old and old > price:
+            lines.append(f"💰 <b>{fmt(price)}</b> بدل <b>{fmt(old)}</b>")
+        else:
+            lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
+    lines.append("⏳ العرض على أمازون مصر لحد نفاد الكمية")
+    lines.append("")
+    lines += list(cl or [])
+    lines += ["🛒 اشتري من هنا:", link, "", f"{tags} #أمازون"]
+    lines += list(footer or [])
+    return "\n".join(lines)
+
+
 CLOSERS = [
     "⏳ الكمية والسعر ممكن يتغيروا في أي وقت.",
     "👌 اطلبه قبل ما يخلص.",
@@ -548,23 +651,7 @@ def short_title(t, limit=95):
 
 
 def build_post(title, price, old, rating, link, compact=False, coupon=None):
-    pct = round((old - price) / old * 100) if (price and old and old > price) else None
-    cl = coupon_block(price, coupon)
-    if compact and pct:
-        # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
-        return "\n".join([
-            opener(pct, title) + f" — {fmt(price)} بدل {fmt(old)}",
-            "",
-        ] + cl + ["🛒 اشتري من هنا:", link, ""] + FOOTER_LINES)
-    lines = [opener(pct, title), "", f"<b>{html.escape(short_title(title))}</b>", ""]
-    if price:
-        lines.append(f"💰 السعر: <b>{fmt(price)}</b>")
-        if old:
-            pct = round((old - price) / old * 100)
-            lines.append(f"🏷️ كان: <s>{fmt(old)}</s> (خصم {pct}%)")
-    lines += [""] + cl + ["🛒 اشتري من هنا:", link, ""]
-    lines += FOOTER_LINES
-    return "\n".join(lines)
+    return deal_post(title, price, old, link, coupon_block(price, coupon), compact, FOOTER_LINES)
 
 
 SHOW_COUPON_BUTTON = False  # زرار "أكواد الخصم" تحت البوستات (غيّرها لـ True لو عايزه يرجع)
@@ -914,7 +1001,7 @@ def _make_shot_draft(raw, url):
     host = urlparse(url).netloc.lower()
     host = host if ("amazon." in host and not host.startswith("link.")) else "www.amazon.eg"
     img, info = shot_card.make_shot(raw)
-    post = "\n".join([opener(None, ""), "", "🛒 اشتري من هنا:", affiliate(host, asin), ""] + FOOTER_LINES)
+    post = "\n".join([intro(), "", "🛒 اشتري من هنا:", affiliate(host, asin), ""] + FOOTER_LINES)
     return True, {"image": img, "post": post, "info": info}
 
 
