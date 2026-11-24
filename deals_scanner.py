@@ -534,9 +534,37 @@ def coupon_lines(item):
 
 
 def build_deal_post(item, compact=False):
+    hot = item["pct"] >= HOT_DISCOUNT
+    head = pb.opener(item["pct"], item.get("title", ""), hot)
     link = pb.affiliate(MARKETPLACE, item["asin"])
-    return pb.deal_post(item["title"], item["price"], item["old"], link,
-                        coupon_lines(item), compact, footer_lines())
+    if compact:
+        # الكارت فيه العنوان والسعر، فالكلام هنا مختصر
+        return "\n".join(
+            [
+                head,
+                f"{pb.fmt(item['price'])} بدل {pb.fmt(item['old'])}",
+                "",
+            ] + coupon_lines(item) + [
+                "🛒 اشتري من هنا:",
+                link,
+                "",
+            ] + footer_lines()
+        )
+    return "\n".join(
+        [
+            head,
+            "",
+            f"<b>{html.escape(pb.short_title(item['title']))}</b>",
+            "",
+            f"💰 السعر: <b>{pb.fmt(item['price'])}</b>",
+            f"🏷️ كان: <s>{pb.fmt(item['old'])}</s> (خصم {item['pct']}%)",
+            "",
+        ] + coupon_lines(item) + [
+            "🛒 اشتري من هنا:",
+            link,
+            "",
+        ] + footer_lines()
+    )
 
 
 def scan_once():
