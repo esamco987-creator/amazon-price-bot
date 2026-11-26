@@ -27,6 +27,7 @@ CHANNEL = os.environ.get("FB_CHANNEL", "PromoCodeOnlain")
 GAP = float(os.environ.get("FB_GAP_MIN", "20")) * 60
 QUIET = os.environ.get("FB_QUIET", "1-8")
 GRAPH = "https://graph.facebook.com/v21.0"
+MAX_AGE = float(os.environ.get("FB_MAX_AGE_H", "4")) * 3600
 ASIN_RE = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})")
 HOURS24 = 24 * 3600
 
@@ -46,7 +47,7 @@ def quiet_now():
         a, b = [int(x) for x in QUIET.split("-")]
     except Exception:
         return False
-    cairo = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    cairo = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
     h = cairo.hour
     return (a <= h < b) if a < b else (h >= a or h < b)
 
@@ -84,10 +85,14 @@ async def worker():
         try:
             if quiet_now() or time.time() - last_post_ts(db) < GAP:
                 continue
-            row = db.execute("SELECT id,text,img FROM fb_queue WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+            db.execute("UPDATE fb_queue SET status='expired' WHERE status='pending' AND created<?",
+                       (int(time.time() - MAX_AGE),))
+            db.commit()
+            row = db.execute("SELECT id,text,img FROM fb_queue WHERE status='pending' ORDER BY id DESC LIMIT 1").fetchone()
             if not row:
                 continue
             qid, text, img = row
+            log.info("posting to facebook now (queue id %s, photo=%s)...", qid, bool(img))
             try:
                 fid = await asyncio.to_thread(post_to_facebook, text, img)
                 db.execute("UPDATE fb_queue SET status='posted', posted_ts=?, fb_id=? WHERE id=?",
