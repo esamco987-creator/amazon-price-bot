@@ -1,0 +1,151 @@
+"""بوت النشر على فيسبوك: بيراقب قناة التليجرام وينشر كل بوست جديد على صفحة إيجي فون.
+
+- بيستخدم نسخة من جلسة Telethon (fbpost.session) عشان ما يتعارضش مع بوت التحويل.
+- بيحط البوستات في طابور وينشر بوست كل FB_GAP_MIN دقيقة (افتراضي 20) عشان فيسبوك ما يعتبرهاش سبام.
+- بيتجاهل البوست لو نفس المنتج اتنشر في آخر 24 ساعة (يعني الإعادات ما بتتنشرش تاني).
+- ساعات الهدوء (افتراضي 1-8 الصبح بتوقيت القاهرة): مفيش نشر.
+المطلوب في env.sh: API_ID, API_HASH, FB_PAGE_ID, FB_PAGE_TOKEN
+اختياري: FB_GAP_MIN, FB_QUIET (مثلا 1-8 أو off), FB_CHANNEL
+"""
+import os, re, io, time, sqlite3, asyncio, logging, datetime
+
+import requests
+from telethon import TelegramClient, events
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+for _n in ("telethon",):
+    logging.getLogger(_n).setLevel(logging.WARNING)
+log = logging.getLogger("fb_poster")
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(BASE, "bot_data.db")
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+PAGE_ID = os.environ["FB_PAGE_ID"]
+PAGE_TOKEN = os.environ["FB_PAGE_TOKEN"]
+CHANNEL = os.environ.get("FB_CHANNEL", "PromoCodeOnlain")
+GAP = float(os.environ.get("FB_GAP_MIN", "20")) * 60
+QUIET = os.environ.get("FB_QUIET", "1-8")
+GRAPH = "https://graph.facebook.com/v21.0"
+ASIN_RE = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})")
+HOURS24 = 24 * 3600
+
+
+def con():
+    c = sqlite3.connect(DB)
+    c.execute("""CREATE TABLE IF NOT EXISTS fb_queue(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id INTEGER UNIQUE, asin TEXT, text TEXT,
+        img BLOB, created INTEGER, status TEXT DEFAULT 'pending', posted_ts INTEGER, fb_id TEXT, note TEXT)""")
+    return c
+
+
+def quiet_now():
+    if QUIET.lower() in ("", "off", "no", "0"):
+        return False
+    try:
+        a, b = [int(x) for x in QUIET.split("-")]
+    except Exception:
+        return False
+    cairo = datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    h = cairo.hour
+    return (a <= h < b) if a < b else (h >= a or h < b)
+
+
+def clean(text):
+    t = (text or "").strip()
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t[:2000]
+
+
+def last_post_ts(db):
+    r = db.execute("SELECT MAX(posted_ts) FROM fb_queue WHERE status='posted'").fetchone()
+    return r[0] or 0
+
+
+def post_to_facebook(text, img):
+    if img:
+        r = requests.post(f"{GRAPH}/{PAGE_ID}/photos", data={"caption": text, "access_token": PAGE_TOKEN},
+                          files={"source": ("deal.jpg", img, "image/jpeg")}, timeout=90)
+    else:
+        r = requests.post(f"{GRAPH}/{PAGE_ID}/feed", data={"message": text, "access_token": PAGE_TOKEN}, timeout=60)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"error": {"message": r.text[:200]}}
+    if r.status_code != 200 or "error" in j:
+        raise RuntimeError(str(j.get("error", j))[:300])
+    return j.get("post_id") or j.get("id")
+
+
+async def worker():
+    db = con()
+    while True:
+        await asyncio.sleep(30)
+        try:
+            if quiet_now() or time.time() - last_post_ts(db) < GAP:
+                continue
+            row = db.execute("SELECT id,text,img FROM fb_queue WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
+            if not row:
+                continue
+            qid, text, img = row
+            try:
+                fid = await asyncio.to_thread(post_to_facebook, text, img)
+                db.execute("UPDATE fb_queue SET status='posted', posted_ts=?, fb_id=? WHERE id=?",
+                           (int(time.time()), fid, qid))
+                log.info("posted to facebook: %s", fid)
+            except Exception as e:
+                msg = str(e)
+                log.warning("facebook post failed: %s", msg)
+                bad = any(k in msg for k in ("190", "OAuthException", "expired", "permission", "(#200)", "(#10)"))
+                db.execute("UPDATE fb_queue SET status=?, note=? WHERE id=?",
+                           ("failed", msg[:200], qid))
+                if bad:
+                    log.error("المفتاح أو الصلاحيات فيها مشكلة. اوقف البوت وراجع الإعداد.")
+                    await asyncio.sleep(600)
+            db.commit()
+        except Exception as e:
+            log.warning("worker error: %s", e)
+
+
+async def main():
+    client = TelegramClient(os.path.join(BASE, "fbpost"), API_ID, API_HASH)
+    await client.start()
+    db = con()
+    ent = await client.get_entity(CHANNEL)
+    log.info("fb poster on: channel=%s gap=%smin quiet=%s", CHANNEL, GAP / 60, QUIET)
+
+    @client.on(events.NewMessage(chats=ent))
+    async def on_msg(ev):
+        m = ev.message
+        text = clean(m.message)
+        if not text:
+            return
+        asin = (ASIN_RE.search(text) or [None, None])[1]
+        if asin:
+            r = db.execute("SELECT 1 FROM fb_queue WHERE asin=? AND created>? LIMIT 1",
+                           (asin, int(time.time()) - HOURS24)).fetchone()
+            if r:
+                log.info("skip duplicate %s", asin)
+                return
+        img = None
+        if m.photo:
+            try:
+                buf = io.BytesIO()
+                await client.download_media(m, file=buf)
+                img = buf.getvalue()
+            except Exception as e:
+                log.warning("photo download failed: %s", e)
+        try:
+            db.execute("INSERT INTO fb_queue(msg_id,asin,text,img,created) VALUES(?,?,?,?,?)",
+                       (m.id, asin, text, img, int(time.time())))
+            db.commit()
+            log.info("queued msg %s", m.id)
+        except sqlite3.IntegrityError:
+            pass
+
+    asyncio.create_task(worker())
+    await client.run_until_disconnected()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
