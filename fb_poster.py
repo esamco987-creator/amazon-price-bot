@@ -30,6 +30,28 @@ GRAPH = "https://graph.facebook.com/v21.0"
 MAX_AGE = float(os.environ.get("FB_MAX_AGE_H", "4")) * 3600
 ASIN_RE = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})")
 HOURS24 = 24 * 3600
+TG_LINK = os.environ.get("FB_TG_LINK", "https://t.me/PromoCodeOnlain")
+CTAS = [
+    "🔥 عروض زي دي كل يوم على قناتنا في تليجرام 👇",
+    "🚨 انضم لقناتنا وماتفوتش أي خصم 👇",
+    "💸 وفّر فلوسك! عروضنا على تليجرام 👇",
+    "🎁 أقوى العروض أول بأول على تليجرام 👇",
+    "⚡ عروض جديدة يومياً على قناتنا 👇",
+    "👀 في أحلى من كده على قناتنا في تليجرام 👇",
+    "🛒 قبل ما تشتري، شوف قناتنا في تليجرام 👇",
+    "💥 الخصومات النار بتنزل الأول على تليجرام 👇",
+    "🔔 فعّل إشعارات قناتنا وماتفوتش عرض 👇",
+    "🏷️ خصومات حقيقية يومياً على تليجرام 👇",
+    "🤑 أكواد وعروض يومية على قناتنا 👇",
+    "🚀 انضم لقناتنا وخلّي العروض توصلك فوراً 👇",
+]
+_last_cta = [None]
+
+
+def with_cta(text):
+    pool = [c for c in CTAS if c != _last_cta[0]] or CTAS
+    _last_cta[0] = pool[int(time.time()) % len(pool)]
+    return f"{text}\n\n{_last_cta[0]}\n{TG_LINK}"
 
 
 def con():
@@ -94,7 +116,7 @@ async def worker():
             qid, text, img = row
             log.info("posting to facebook now (queue id %s, photo=%s)...", qid, bool(img))
             try:
-                fid = await asyncio.to_thread(post_to_facebook, text, img)
+                fid = await asyncio.to_thread(post_to_facebook, with_cta(text), img)
                 db.execute("UPDATE fb_queue SET status='posted', posted_ts=?, fb_id=? WHERE id=?",
                            (int(time.time()), fid, qid))
                 log.info("posted to facebook: %s", fid)
