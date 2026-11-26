@@ -1,9 +1,9 @@
 """بوت النشر على فيسبوك: بيراقب قناة التليجرام وينشر كل بوست جديد على صفحة إيجي فون.
 
 - بيستخدم نسخة من جلسة Telethon (fbpost.session) عشان ما يتعارضش مع بوت التحويل.
-- بيحط البوستات في طابور وينشر بوست كل FB_GAP_MIN دقيقة (افتراضي 20) عشان فيسبوك ما يعتبرهاش سبام.
+- بيحط البوستات في طابور وينشر بوست كل FB_GAP_MIN دقيقة (افتراضي 15) عشان فيسبوك ما يعتبرهاش سبام.
 - بيتجاهل البوست لو نفس المنتج اتنشر في آخر 24 ساعة (يعني الإعادات ما بتتنشرش تاني).
-- ساعات الهدوء (افتراضي 1-8 الصبح بتوقيت القاهرة): مفيش نشر.
+- ساعات الهدوء (افتراضي 2-7 الصبح بتوقيت القاهرة): مفيش نشر.
 المطلوب في env.sh: API_ID, API_HASH, FB_PAGE_ID, FB_PAGE_TOKEN
 اختياري: FB_GAP_MIN, FB_QUIET (مثلا 1-8 أو off), FB_CHANNEL
 """
@@ -24,8 +24,8 @@ API_HASH = os.environ["API_HASH"]
 PAGE_ID = os.environ["FB_PAGE_ID"]
 PAGE_TOKEN = os.environ["FB_PAGE_TOKEN"]
 CHANNEL = os.environ.get("FB_CHANNEL", "PromoCodeOnlain")
-GAP = float(os.environ.get("FB_GAP_MIN", "20")) * 60
-QUIET = os.environ.get("FB_QUIET", "1-8")
+GAP = float(os.environ.get("FB_GAP_MIN", "15")) * 60
+QUIET = os.environ.get("FB_QUIET", "2-7")
 GRAPH = "https://graph.facebook.com/v21.0"
 MAX_AGE = float(os.environ.get("FB_MAX_AGE_H", "4")) * 3600
 ASIN_RE = re.compile(r"/(?:dp|gp/product)/([A-Z0-9]{10})")
@@ -78,6 +78,21 @@ def clean(text):
     t = (text or "").strip()
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t[:2000]
+
+
+PRICE_RE = re.compile(r"\d[\d,\.]*\s*(?:جنيه|ج\.م|EGP)|(?:جنيه|EGP)\s*\d", re.I)
+REQUIRE_PHOTO = os.environ.get("FB_REQUIRE_PHOTO", "1") != "0"
+
+
+def incomplete_reason(text, img):
+    """بوست كامل = صورة + سعر + لينك. بيرجع سبب النقص أو None."""
+    if REQUIRE_PHOTO and not img:
+        return "من غير صورة"
+    if not PRICE_RE.search(text):
+        return "من غير سعر"
+    if "http" not in text:
+        return "من غير لينك"
+    return None
 
 
 def last_post_ts(db):
@@ -141,19 +156,12 @@ async def main():
     ent = await client.get_entity(CHANNEL)
     log.info("fb poster on: channel=%s gap=%smin quiet=%s", CHANNEL, GAP / 60, QUIET)
 
+    last_photo = {"img": None, "ts": 0}
+
     @client.on(events.NewMessage(chats=ent))
     async def on_msg(ev):
         m = ev.message
         text = clean(m.message)
-        if not text:
-            return
-        asin = (ASIN_RE.search(text) or [None, None])[1]
-        if asin:
-            r = db.execute("SELECT 1 FROM fb_queue WHERE asin=? AND created>? LIMIT 1",
-                           (asin, int(time.time()) - HOURS24)).fetchone()
-            if r:
-                log.info("skip duplicate %s", asin)
-                return
         img = None
         if m.photo:
             try:
@@ -162,6 +170,24 @@ async def main():
                 img = buf.getvalue()
             except Exception as e:
                 log.warning("photo download failed: %s", e)
+        if not text:
+            if img:                       # صورة لوحدها: البوت بيبعت النص في رسالة بعدها
+                last_photo.update(img=img, ts=time.time())
+            return
+        if not img and last_photo["img"] and time.time() - last_photo["ts"] < 120:
+            img = last_photo["img"]       # النص جه بعد صورته مباشرة
+        last_photo["img"] = None
+        why = incomplete_reason(text, img)
+        if why:
+            log.info("skip msg %s (بوست ناقص: %s)", m.id, why)
+            return
+        asin = (ASIN_RE.search(text) or [None, None])[1]
+        if asin:
+            r = db.execute("SELECT 1 FROM fb_queue WHERE asin=? AND created>? LIMIT 1",
+                           (asin, int(time.time()) - HOURS24)).fetchone()
+            if r:
+                log.info("skip duplicate %s", asin)
+                return
         try:
             db.execute("INSERT INTO fb_queue(msg_id,asin,text,img,created) VALUES(?,?,?,?,?)",
                        (m.id, asin, text, img, int(time.time())))
