@@ -19,18 +19,28 @@ def get(path, **params):
 
 def main():
     app_id = input("App ID: ").strip()
-    secret = getpass.getpass("App Secret (مش هيظهر وانت بتلصقه): ").strip()
+    print("اكتب الـ App Secret بإيدك (هيظهر على الشاشة وانت بتكتب، ومحدش شايف شاشتك غيرك).")
+    while True:
+        secret = input("App Secret: ").strip().replace(" ", "")
+        if len(secret) == 32 and all(c in "0123456789abcdefABCDEF" for c in secret):
+            break
+        print(f"طوله {len(secret)} حرف ومفروض 32 (أرقام وحروف a-f بس). راجعه وجرب تاني.")
     short = getpass.getpass("التوكن المؤقت (مش هيظهر): ").strip()
     ll = get("oauth/access_token", grant_type="fb_exchange_token", client_id=app_id,
              client_secret=secret, fb_exchange_token=short)["access_token"]
-    pages = get("me/accounts", access_token=ll).get("data", [])
-    if not pages:
-        print("ملقيتش صفحات. اتأكد إنك اخترت الصفحة وأذنت بالصلاحيات.")
-        return
-    for i, p in enumerate(pages, 1):
-        print(f"{i}) {p['name']}")
-    n = int(input("رقم الصفحة: ").strip()) - 1
-    page = pages[n]
+    PAGE_ID = "415365899219882"      # إيجي فون
+    page = None
+    try:
+        page = get(PAGE_ID, fields="name,access_token", access_token=ll)
+    except SystemExit:
+        page = None
+    if not page or not page.get("access_token"):
+        print("مقدرتش أجيب مفتاح الصفحة مباشرة. بجرب القايمة العادية...")
+        pages = get("me/accounts", access_token=ll).get("data", [])
+        page = next((p for p in pages if p["id"] == PAGE_ID), None)
+        if not page:
+            print("الصفحة مش ظاهرة للتطبيق. لازم تدّي حسابك صلاحية على الصفحة من إعدادات الأعمال، وابعتلي الرسالة دي.")
+            return
     path = os.path.expanduser("~/env.sh")
     lines = []
     if os.path.exists(path):
